@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"time"
 
 	"github.com/topolvm/topolvm/internal/lvmd/command"
 	"github.com/topolvm/topolvm/pkg/lvmd/proto"
@@ -11,6 +12,10 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
+
+// watchMinInterval is the shortest time between two reports sent to one
+// watcher. Changes notified in the meantime are coalesced into the next one.
+var watchMinInterval = time.Second
 
 // NewVGService creates a VGServiceServer
 func NewVGService(manager *DeviceClassManager) (proto.VGServiceServer, func()) {
@@ -219,15 +224,30 @@ func (s *vgService) Watch(_ *proto.Empty, server proto.VGService_WatchServer) er
 	defer s.removeWatcher(num)
 
 	// Initial notification on startup
+	lastSent := time.Now()
 	if err := s.send(server); err != nil {
 		return err
 	}
 
+	// Each report is a full report of every volume group, so at most one is
+	// taken per watchMinInterval: a burst of changes produces one report at
+	// the end of each interval instead of a report after every change, each
+	// holding the volume groups' locks while the changes wait for them.
+	// Notifications that arrive while waiting or sending stay coalesced in
+	// the channel, which holds one.
 	for {
 		select {
 		case <-server.Context().Done():
 			return server.Context().Err()
 		case <-ch:
+			if wait := time.Until(lastSent.Add(watchMinInterval)); wait > 0 {
+				select {
+				case <-server.Context().Done():
+					return server.Context().Err()
+				case <-time.After(wait):
+				}
+			}
+			lastSent = time.Now()
 			if err := s.send(server); err != nil {
 				return err
 			}
