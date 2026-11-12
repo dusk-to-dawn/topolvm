@@ -101,6 +101,22 @@ func FindVolumeGroup(ctx context.Context, name string) (*VolumeGroup, error) {
 	return &VolumeGroup{state: vg}, nil
 }
 
+// FindVolumeGroupWithVolumes finds a named volume group together with all of
+// its logical volumes, using a single lvm command.
+//
+// The returned VolumeGroup answers FindPool, ListPools, ListVolumes and
+// FindVolume (and the same methods of its pools) from that one report without
+// running further commands, so it describes the volume group as it was when
+// this function was called. Use LookupVolume to read a volume that was created
+// or changed afterwards.
+func FindVolumeGroupWithVolumes(ctx context.Context, name string) (*VolumeGroup, error) {
+	state, lvs, err := getVGState(ctx, name)
+	if err != nil {
+		return nil, err
+	}
+	return &VolumeGroup{state: state, reportLvs: filterLV(name, lvs)}, nil
+}
+
 func SearchVolumeGroupList(vgs []*VolumeGroup, name string) (*VolumeGroup, error) {
 	for _, vg := range vgs {
 		if vg.state.name == name {
@@ -148,6 +164,21 @@ func (vg *VolumeGroup) FindVolume(ctx context.Context, name string) (*LogicalVol
 	}
 
 	return vol, nil
+}
+
+// LookupVolume reads a named logical volume of this volume group from LVM with
+// a single targeted command. Unlike FindVolume, it never answers from a report
+// held by vg, so it sees volumes created or resized after vg was obtained.
+func (vg *VolumeGroup) LookupVolume(ctx context.Context, name string) (*LogicalVolume, error) {
+	lvs, err := getLVReport(ctx, fullName(name, vg))
+	if err != nil {
+		return nil, err
+	}
+	l, ok := lvs[name]
+	if !ok || l.isThinPool() {
+		return nil, ErrNotFound
+	}
+	return vg.convertLV(l), nil
 }
 
 // ListVolumes lists all logical volumes in this volume group.
@@ -397,6 +428,19 @@ func (t *ThinPool) FindVolume(ctx context.Context, name string) (*LogicalVolume,
 	return volumeCandidate, nil
 }
 
+// LookupVolume reads a named logical volume of this thin pool from LVM with a
+// single targeted command, like VolumeGroup.LookupVolume.
+func (t *ThinPool) LookupVolume(ctx context.Context, name string) (*LogicalVolume, error) {
+	volumeCandidate, err := t.vg.LookupVolume(ctx, name)
+	if err != nil {
+		return nil, err
+	}
+	if volumeCandidate.pool == nil || *volumeCandidate.pool != t.Name() {
+		return nil, ErrNotFound
+	}
+	return volumeCandidate, nil
+}
+
 // CreateVolume creates a thin volume from this pool.
 func (t *ThinPool) CreateVolume(ctx context.Context, name string, size uint64, tags []string, stripe uint, stripeSize string, lvcreateOptions []string) error {
 	lvcreateArgs := []string{
@@ -578,7 +622,7 @@ func (l *LogicalVolume) Resize(ctx context.Context, newSize uint64) error {
 	}
 
 	// now we need to update the size of this volume, as it might slightly differ from the creation argument due to rounding
-	vol, err := l.vg.FindVolume(ctx, l.name)
+	vol, err := l.vg.LookupVolume(ctx, l.name)
 	if err != nil {
 		return err
 	}
@@ -589,7 +633,13 @@ func (l *LogicalVolume) Resize(ctx context.Context, newSize uint64) error {
 
 // RemoveVolume removes the given volume from the volume group.
 func (vg *VolumeGroup) RemoveVolume(ctx context.Context, name string) error {
-	err := callLVM(ctx, "lvremove", "-f", fullName(name, vg))
+	return RemoveVolume(ctx, vg.Name(), name)
+}
+
+// RemoveVolume removes the named volume from the named volume group.
+// It returns an error wrapping ErrNotFound if either does not exist.
+func RemoveVolume(ctx context.Context, vgName, name string) error {
+	err := callLVM(ctx, "lvremove", "-f", vgName+"/"+name)
 
 	if IsLVMNotFound(err) {
 		return errors.Join(ErrNotFound, err)

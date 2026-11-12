@@ -83,7 +83,9 @@ func (s *lvService) CreateLV(ctx context.Context, req *proto.CreateLVRequest) (*
 		return nil, status.Error(codes.Internal, err.Error())
 	}
 
-	lv, err := pool.FindVolume(ctx, req.GetName())
+	// The pool describes the state before the volume was created, so read the
+	// new volume from LVM to return its actual size and device numbers.
+	lv, err := pool.LookupVolume(ctx, req.GetName())
 	if err != nil {
 		logger.Error(err, "failed to find volume",
 			"requested", requested,
@@ -115,15 +117,9 @@ func (s *lvService) RemoveLV(ctx context.Context, req *proto.RemoveLVRequest) (*
 		return nil, status.Errorf(codes.NotFound, "%s: %s", err.Error(), req.DeviceClass)
 	}
 
-	vg, err := command.FindVolumeGroup(ctx, dc.VolumeGroup)
-	if errors.Is(err, command.ErrNotFound) {
-		return nil, status.Errorf(codes.NotFound, "%s: %s", err.Error(), req.DeviceClass)
-	} else if err != nil {
-		logger.Error(err, "failed to get volume group", "name", dc.VolumeGroup)
-		return nil, err
-	}
-
-	if err := vg.RemoveVolume(ctx, req.GetName()); errors.Is(err, command.ErrNotFound) {
+	// lvremove fails with a "not found" error for a missing volume group as
+	// well as for a missing volume, so it needs no separate look-up first.
+	if err := command.RemoveVolume(ctx, dc.VolumeGroup, req.GetName()); errors.Is(err, command.ErrNotFound) {
 		return nil, status.Errorf(codes.NotFound, "%s: %s", err.Error(), req.DeviceClass)
 	} else if err != nil {
 		logger.Error(err, "failed to remove volume", "name", req.GetName())
@@ -153,7 +149,9 @@ func (s *lvService) CreateLVSnapshot(ctx context.Context, req *proto.CreateLVSna
 		return nil, status.Errorf(codes.InvalidArgument, "invalid device class type %v", string(dc.Type))
 	}
 
-	vg, err := command.FindVolumeGroup(ctx, dc.VolumeGroup)
+	// One report answers the look-ups of the source volume, the pool and its
+	// usage below.
+	vg, err := command.FindVolumeGroupWithVolumes(ctx, dc.VolumeGroup)
 	if err != nil {
 		return nil, err
 	}
@@ -222,7 +220,7 @@ func (s *lvService) CreateLVSnapshot(ctx context.Context, req *proto.CreateLVSna
 		return nil, status.Error(codes.Internal, err.Error())
 	}
 
-	snapLV, err := vg.FindVolume(ctx, req.GetName())
+	snapLV, err := vg.LookupVolume(ctx, req.GetName())
 	if err != nil {
 		logger.Error(err, "failed to get snapshot after creation")
 		return nil, status.Error(codes.Internal, err.Error())
