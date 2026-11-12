@@ -68,7 +68,7 @@ jobs:
     needs: plan
     name: "${{ matrix.name }}"
     runs-on: "ubuntu-22.04"
-    timeout-minutes: 60
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}

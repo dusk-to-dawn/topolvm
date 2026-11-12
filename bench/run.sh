@@ -298,7 +298,7 @@ for mode in $MODES; do
       sudo journalctl -u lvmd1.service -o cat --since "@${t0%.*}" > "$rdir/lvmd.log"
       log "round $round: delete"
       t_del=$(date -u +%s.%N)
-      if [ "$mode" = pvc ]; then
+      if [ "$mode" != pods ]; then
         "$KUBECTL" delete pvc -n "$NS" -l "bench=$round" --wait=false >/dev/null
       else
         "$KUBECTL" delete pod -n "$NS" -l "bench=$round" --wait=false >/dev/null
