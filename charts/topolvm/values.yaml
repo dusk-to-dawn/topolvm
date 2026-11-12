@@ -293,6 +293,9 @@ node:
   kubeletWorkDirectory: /var/lib/kubelet
 
   # node.args -- Arguments to be passed to the command.
+  # With this fork's image, `--max-concurrent-reconciles=<n>` lets topolvm-node create, resize and remove up to n volumes at once (default 1).
+  # Raise it above 1 only on nodes whose lvmd runs this fork's image: an older lvmd does not reserve capacity for concurrent changes.
+  # As a safeguard, topolvm-node still sends creations and resizes to an lvmd that does not advertise capacity reservations one at a time.
   args: []
 
   csiRegistrar:

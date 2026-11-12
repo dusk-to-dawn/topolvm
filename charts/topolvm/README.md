@@ -6,6 +6,19 @@
 > `controller.csiSnapshotter.args` and `node.csiRegistrar.args`, backported from
 > upstream's main branch), and the default image is a build of TopoLVM 0.42.1 with
 > faster volume provisioning.
+>
+> Concurrency: topolvm-node runs one worker unless `node.args` sets
+> `--max-concurrent-reconciles`. Raise it only once lvmd on every node runs this
+> fork's image, because an older lvmd does not reserve capacity for concurrent
+> changes. topolvm-node also keeps creations and resizes serial against an lvmd
+> that does not advertise capacity reservations, but treat that as a safeguard,
+> not as the rollout plan.
+>
+> Hung LVM commands: lvmd runs at most 16 `lvm` commands at once
+> (`--max-concurrent-lvm-commands`). A command that hangs, for example while LVM
+> waits for udev, keeps its slot until it exits; cancelling the call that started
+> it stops only the `nsenter` wrapper. If as many commands hang as there are
+> slots, later calls fail at their deadlines instead of starting more processes.
 
 ## Prerequisites
 
@@ -110,7 +123,7 @@ See [Getting Started](https://github.com/topolvm/topolvm/blob/topolvm-chart-v17.
 | node.additionalContainers | list | `[]` | Define extra containers to add to the Daemonset. Please ensure not to use any existing container names. |
 | node.additionalVolumes | list | `[]` | Specify additional volumes without conflicting with default volumes most useful for initContainers but available to all containers in the pod. |
 | node.affinity | object | `{}` | Specify affinity. # ref: https://kubernetes.io/docs/concepts/configuration/assign-pod-node/#affinity-and-anti-affinity |
-| node.args | list | `[]` | Arguments to be passed to the command. |
+| node.args | list | `[]` | Arguments to be passed to the command. With this fork's image, `--max-concurrent-reconciles=<n>` lets topolvm-node create, resize and remove up to n volumes at once (default 1). Raise it above 1 only on nodes whose lvmd runs this fork's image: an older lvmd does not reserve capacity for concurrent changes. As a safeguard, topolvm-node still sends creations and resizes to an lvmd that does not advertise capacity reservations one at a time. |
 | node.csiRegistrar.args | list | `[]` | Arguments to be passed to the csi-registrar command. |
 | node.initContainers | list | `[]` | Additional initContainers for the node service. |
 | node.kubeletWorkDirectory | string | `"/var/lib/kubelet"` | Specify the work directory of Kubelet on the host. For example, on microk8s it needs to be set to `/var/snap/microk8s/common/var/lib/kubelet` |

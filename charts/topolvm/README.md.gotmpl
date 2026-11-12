@@ -6,6 +6,19 @@
 > `controller.csiSnapshotter.args` and `node.csiRegistrar.args`, backported from
 > upstream's main branch), and the default image is a build of TopoLVM 0.42.1 with
 > faster volume provisioning.
+>
+> Concurrency: topolvm-node runs one worker unless `node.args` sets
+> `--max-concurrent-reconciles`. Raise it only once lvmd on every node runs this
+> fork's image, because an older lvmd does not reserve capacity for concurrent
+> changes. topolvm-node also keeps creations and resizes serial against an lvmd
+> that does not advertise capacity reservations, but treat that as a safeguard,
+> not as the rollout plan.
+>
+> Hung LVM commands: lvmd runs at most 16 `lvm` commands at once
+> (`--max-concurrent-lvm-commands`). A command that hangs, for example while LVM
+> waits for udev, keeps its slot until it exits; cancelling the call that started
+> it stops only the `nsenter` wrapper. If as many commands hang as there are
+> slots, later calls fail at their deadlines instead of starting more processes.
 
 ## Prerequisites
 
