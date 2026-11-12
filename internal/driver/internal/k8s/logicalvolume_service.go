@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"sync"
 	"time"
 
 	"github.com/topolvm/topolvm"
@@ -15,9 +16,11 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
+	toolscache "k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -36,6 +39,95 @@ type LogicalVolumeService struct {
 	}
 	getter       getter.Interface
 	volumeGetter *volumeGetter
+	// changes wakes up callers waiting for a LogicalVolume to change.
+	changes *changeNotifier
+}
+
+// changeNotifier lets callers wait for events on a LogicalVolume, delivered
+// by the informer whose cache the service reads from. The informer updates
+// its cache before it delivers an event, so a woken caller reads the change.
+type changeNotifier struct {
+	mu      sync.Mutex
+	waiters map[string]map[chan struct{}]struct{}
+}
+
+func newChangeNotifier() *changeNotifier {
+	return &changeNotifier{waiters: map[string]map[chan struct{}]struct{}{}}
+}
+
+// watch returns a channel that receives a value after the named
+// LogicalVolume changes, and a function to stop watching.
+func (n *changeNotifier) watch(name string) (<-chan struct{}, func()) {
+	ch := make(chan struct{}, 1)
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.waiters[name] == nil {
+		n.waiters[name] = map[chan struct{}]struct{}{}
+	}
+	n.waiters[name][ch] = struct{}{}
+	return ch, func() {
+		n.mu.Lock()
+		defer n.mu.Unlock()
+		delete(n.waiters[name], ch)
+		if len(n.waiters[name]) == 0 {
+			delete(n.waiters, name)
+		}
+	}
+}
+
+func (n *changeNotifier) notify(obj any) {
+	if tombstone, ok := obj.(toolscache.DeletedFinalStateUnknown); ok {
+		obj = tombstone.Obj
+	}
+	o, err := meta.Accessor(obj)
+	if err != nil {
+		return
+	}
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	for ch := range n.waiters[o.GetName()] {
+		select {
+		case ch <- struct{}{}:
+		default:
+		}
+	}
+}
+
+// fallbackPoll is how often a waiter checks the LogicalVolume when no event
+// arrives. Events normally end a wait first; this only bounds how long a
+// missed event could delay it, as the polling did before events were used.
+var fallbackPoll = wait.Backoff{
+	Duration: 1 * time.Second,
+	Factor:   2,
+	Jitter:   0.1,
+	Steps:    math.MaxInt,
+	Cap:      10 * time.Second,
+}
+
+// waitForChange calls condition now and again after every change of the
+// named LogicalVolume, until it reports done or an error, or ctx ends.
+// Conditions read through the service's cache-backed getter, so waiting
+// costs no requests to the API server beyond the ones a condition makes
+// when the cache does not have the object.
+func (s *LogicalVolumeService) waitForChange(ctx context.Context, name string, fallback wait.Backoff, condition func(ctx context.Context) (bool, error)) error {
+	changed, stop := s.changes.watch(name)
+	defer stop()
+	delay := fallback.DelayFunc()
+	for {
+		done, err := condition(ctx)
+		if err != nil || done {
+			return err
+		}
+		timer := time.NewTimer(delay())
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-changed:
+			timer.Stop()
+		case <-timer.C:
+		}
+	}
 }
 
 const (
@@ -128,6 +220,23 @@ func (v *volumeGetter) Get(ctx context.Context, volumeID string) (*topolvmv1.Log
 // NewLogicalVolumeService returns LogicalVolumeService.
 func NewLogicalVolumeService(mgr manager.Manager) (*LogicalVolumeService, error) {
 	ctx := context.Background()
+	var lvObject client.Object = &topolvmv1.LogicalVolume{}
+	if topolvm.UseLegacy() {
+		lvObject = &topolvmlegacyv1.LogicalVolume{}
+	}
+	changes := newChangeNotifier()
+	informer, err := mgr.GetCache().GetInformer(ctx, lvObject)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := informer.AddEventHandler(toolscache.ResourceEventHandlerFuncs{
+		AddFunc:    changes.notify,
+		UpdateFunc: func(_, obj any) { changes.notify(obj) },
+		DeleteFunc: changes.notify,
+	}); err != nil {
+		return nil, err
+	}
+
 	if topolvm.UseLegacy() {
 		err := mgr.GetFieldIndexer().IndexField(ctx, &topolvmlegacyv1.LogicalVolume{}, indexFieldVolumeID, func(o client.Object) []string {
 			return []string{o.(*topolvmlegacyv1.LogicalVolume).Status.VolumeID}
@@ -150,6 +259,7 @@ func NewLogicalVolumeService(mgr manager.Manager) (*LogicalVolumeService, error)
 		writer:       client,
 		getter:       newRetryMissingGetter(client, apiReader),
 		volumeGetter: &volumeGetter{cacheReader: client, apiReader: apiReader},
+		changes:      changes,
 	}, nil
 }
 
@@ -215,13 +325,9 @@ func (s *LogicalVolumeService) DeleteVolume(ctx context.Context, volumeID string
 	}
 
 	// wait until delete the target volume
-	return wait.Backoff{
-		Duration: 100 * time.Millisecond, // initial backoff
-		Factor:   2,                      // factor for duration increase
-		Jitter:   0.1,
-		Steps:    math.MaxInt, // run for infinity; we assume context gets canceled
-		Cap:      10 * time.Second,
-	}.DelayFunc().Until(ctx, true, false, func(ctx context.Context) (bool, error) {
+	fallback := fallbackPoll
+	fallback.Duration = 100 * time.Millisecond
+	return s.waitForChange(ctx, lv.Name, fallback, func(ctx context.Context) (bool, error) {
 		if err := s.getter.Get(ctx, client.ObjectKey{Name: lv.Name}, new(topolvmv1.LogicalVolume)); err != nil {
 			if apierrors.IsNotFound(err) {
 				return true, nil
@@ -271,13 +377,7 @@ func (s *LogicalVolumeService) ExpandVolume(ctx context.Context, volumeID string
 	}
 
 	var changedLV topolvmv1.LogicalVolume
-	return &changedLV, wait.Backoff{
-		Duration: 1 * time.Second, // initial backoff
-		Factor:   2,               // factor for duration increase
-		Jitter:   0.1,
-		Steps:    math.MaxInt, // run for infinity; we assume context gets canceled
-		Cap:      10 * time.Second,
-	}.DelayFunc().Until(ctx, true, false, func(ctx context.Context) (bool, error) {
+	return &changedLV, s.waitForChange(ctx, lv.Name, fallbackPoll, func(ctx context.Context) (bool, error) {
 		if err := s.getter.Get(ctx, client.ObjectKey{Name: lv.Name}, &changedLV); err != nil {
 			logger.Error(err, "failed to get LogicalVolume", "name", lv.Name)
 			return false, err
@@ -378,13 +478,7 @@ func (s *LogicalVolumeService) create(ctx context.Context, lv *topolvmv1.Logical
 // waitForVolumeProvisioning waits until the volume is fully provisioned or fails
 func (s *LogicalVolumeService) waitForVolumeProvisioning(ctx context.Context, lvName string) (*topolvmv1.LogicalVolume, error) {
 	var newLV topolvmv1.LogicalVolume
-	return &newLV, wait.Backoff{
-		Duration: 1 * time.Second,
-		Factor:   2,
-		Jitter:   0.1,
-		Steps:    math.MaxInt,
-		Cap:      10 * time.Second,
-	}.DelayFunc().Until(ctx, true, false, func(ctx context.Context) (bool, error) {
+	return &newLV, s.waitForChange(ctx, lvName, fallbackPoll, func(ctx context.Context) (bool, error) {
 		if err := s.getter.Get(ctx, client.ObjectKey{Name: lvName}, &newLV); err != nil {
 			logger.Error(err, "failed to get LogicalVolume", "name", lvName)
 			return false, err
