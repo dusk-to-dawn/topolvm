@@ -38,6 +38,8 @@ const (
 	envLockedDelay = "TOPOLVM_FAKE_LVM_LOCKED_DELAY"
 	// envWriteDelay, when set, replaces envDelay for commands that modify state.
 	envWriteDelay = "TOPOLVM_FAKE_LVM_WRITE_DELAY"
+	// envFail names a sub-command that fails without changing anything.
+	envFail = "TOPOLVM_FAKE_LVM_FAIL"
 
 	// keyReport is the top-level key of LVM's JSON reports.
 	keyReport = "report"
@@ -193,6 +195,13 @@ func (f *Fake) Invocations(t testing.TB) []Invocation {
 	return invs
 }
 
+// Fail makes every later run of the named sub-command (for example
+// "lvresize") fail without changing anything, until it is called with "".
+func (f *Fake) Fail(t testing.TB, subCommand string) {
+	t.Helper()
+	t.Setenv(envFail, subCommand)
+}
+
 // Commands returns the lvm commands run so far, one entry per process,
 // each with its arguments joined by spaces.
 func (f *Fake) Commands(t testing.TB) []string {
@@ -304,6 +313,11 @@ func Main(args []string) int {
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return exitUsage
+	}
+
+	if fail := os.Getenv(envFail); fail != "" && fail == cmd {
+		fmt.Fprintf(os.Stderr, "  injected failure of %s\n", cmd)
+		return exitNotFound
 	}
 
 	var code int

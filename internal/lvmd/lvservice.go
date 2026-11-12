@@ -261,26 +261,34 @@ func (s *lvService) CreateLVSnapshot(ctx context.Context, req *proto.CreateLVSna
 		return nil, status.Error(codes.Internal, err.Error())
 	}
 
-	snapLV, err := vg.LookupVolume(ctx, req.GetName())
-	if err != nil {
-		logger.Error(err, "failed to get snapshot after creation")
+	// From here on the snapshot LV exists. If a later step fails, remove it, so
+	// that an incomplete snapshot (at the wrong size, or writable when it should
+	// be read-only) is never left behind to be mistaken for a finished one.
+	// The caller records the failure and retries from scratch.
+	fail := func(msg string, err error) (*proto.CreateLVSnapshotResponse, error) {
+		logger.Error(err, msg)
+		if rmErr := vg.RemoveVolume(ctx, req.GetName()); rmErr != nil {
+			logger.Error(rmErr, "failed to delete incomplete snapshot volume")
+		} else {
+			logger.Info("deleted incomplete snapshot volume")
+		}
 		return nil, status.Error(codes.Internal, err.Error())
 	}
 
+	snapLV, err := vg.LookupVolume(ctx, req.GetName())
+	if err != nil {
+		return fail("failed to get snapshot after creation", err)
+	}
+
+	// The source may have grown since the report, in which case the snapshot is
+	// larger than desiredSize and cannot be shrunk to it: fail and start over.
 	if err := snapLV.Resize(ctx, desiredSize); err != nil {
-		logger.Error(err, "failed to resize snapshot volume")
-		return nil, status.Error(codes.Internal, err.Error())
+		return fail("failed to resize snapshot volume", err)
 	}
 
 	// If source volume is thin, activate the thin snapshot lv with accessmode.
 	if err := snapLV.Activate(ctx, req.AccessType); err != nil {
-		logger.Error(err, "failed to activate snapshot volume")
-		if err := vg.RemoveVolume(ctx, req.GetName()); err != nil {
-			logger.Error(err, "failed to delete snapshot after activation failed")
-		} else {
-			logger.Info("deleted a snapshot")
-		}
-		return nil, status.Error(codes.Internal, err.Error())
+		return fail("failed to activate snapshot volume", err)
 	}
 
 	s.notify()
