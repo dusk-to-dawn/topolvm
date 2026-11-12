@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"slices"
 	"sync"
 	"time"
@@ -113,12 +114,13 @@ var _ = Describe("LogicalVolume controller", func() {
 	var vgService MockVGServiceClient
 	var lvService MockLVServiceClient
 
-	startReconciler := func(suffix string) {
+	startReconcilerWithWorkers := func(suffix string, workers int) {
 		skipNameValidation := true
 		mgr, err := ctrl.NewManager(cfg, ctrl.Options{
 			Scheme: scheme,
 			Controller: config.Controller{
-				SkipNameValidation: &skipNameValidation,
+				SkipNameValidation:      &skipNameValidation,
+				MaxConcurrentReconciles: workers,
 			},
 			Metrics: server.Options{
 				BindAddress: "0", // disable metrics
@@ -139,6 +141,9 @@ var _ = Describe("LogicalVolume controller", func() {
 			errCh <- mgr.Start(ctx)
 		}()
 		time.Sleep(100 * time.Millisecond)
+	}
+	startReconciler := func(suffix string) {
+		startReconcilerWithWorkers(suffix, 1)
 	}
 
 	AfterEach(func() {
@@ -321,5 +326,54 @@ var _ = Describe("LogicalVolume controller", func() {
 			g.Expect(lv.Status.Code).To(Equal(codes.ResourceExhausted))
 			g.Expect(lv.Status.VolumeID).To(BeEmpty())
 		}).Should(Succeed())
+	})
+	It("should create LVs concurrently with several workers", func() {
+		const workers = 4
+		var mu sync.Mutex
+		inFlight, peak := 0, 0
+		allIn := make(chan struct{})
+		setMockCreateLVHook(func(in *proto.CreateLVRequest) error {
+			// Called with the mock's lock held: release it while waiting.
+			mockLVMD.Unlock()
+			defer mockLVMD.Lock()
+			mu.Lock()
+			inFlight++
+			peak = max(peak, inFlight)
+			if inFlight == workers {
+				close(allIn)
+			}
+			mu.Unlock()
+			defer func() {
+				mu.Lock()
+				inFlight--
+				mu.Unlock()
+			}()
+			select {
+			case <-allIn:
+				return nil
+			case <-time.After(20 * time.Second):
+				return status.Error(codes.DeadlineExceeded, "creations did not overlap")
+			}
+		})
+		DeferCleanup(func() { setMockCreateLVHook(nil) })
+		startReconcilerWithWorkers("-concurrent", workers)
+		ctx := context.Background()
+
+		first := setupResources(ctx, "-concurrent")
+		lvs := []topolvmv1.LogicalVolume{first}
+		for i := 1; i < workers; i++ {
+			lv := topolvmv1.LogicalVolume{
+				ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("%s-%d", first.Name, i)},
+				Spec:       topolvmv1.LogicalVolumeSpec{NodeName: first.Spec.NodeName},
+			}
+			Expect(k8sClient.Create(ctx, &lv)).To(Succeed())
+			lvs = append(lvs, lv)
+		}
+		for i := range lvs {
+			waitForVolumeID(ctx, &lvs[i])
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		Expect(peak).To(Equal(workers))
 	})
 })
