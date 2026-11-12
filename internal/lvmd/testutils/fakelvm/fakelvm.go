@@ -36,6 +36,8 @@ const (
 	// envLockedDelay is a delay applied to commands that modify state while
 	// they hold the lock, standing in for metadata writes and activation.
 	envLockedDelay = "TOPOLVM_FAKE_LVM_LOCKED_DELAY"
+	// envWriteDelay, when set, replaces envDelay for commands that modify state.
+	envWriteDelay = "TOPOLVM_FAKE_LVM_WRITE_DELAY"
 
 	// keyReport is the top-level key of LVM's JSON reports.
 	keyReport = "report"
@@ -122,6 +124,8 @@ type Options struct {
 	Delay time.Duration
 	// LockedDelay is applied to modifying commands while they hold the lock.
 	LockedDelay time.Duration
+	// WriteDelay, if set, replaces Delay for modifying commands.
+	WriteDelay time.Duration
 }
 
 // Start writes the initial state, makes lvm commands started by this test
@@ -149,6 +153,7 @@ func Start(t testing.TB, initial State, opts Options, getPrefix func() []string,
 	t.Setenv(envLog, f.logPath)
 	t.Setenv(envDelay, opts.Delay.String())
 	t.Setenv(envLockedDelay, opts.LockedDelay.String())
+	t.Setenv(envWriteDelay, opts.WriteDelay.String())
 
 	prev := getPrefix()
 	setPrefix([]string{bin})
@@ -274,8 +279,6 @@ func Main(args []string) int {
 			fmt.Fprintln(os.Stderr, err)
 		}
 	}()
-	sleepEnv(envDelay)
-
 	cmd, opts, pos := parse(args)
 
 	// Like LVM's per-VG lock: reports share it, modifying commands hold it exclusively.
@@ -283,6 +286,11 @@ func Main(args []string) int {
 	switch cmd {
 	case "lvcreate", "lvremove", "lvresize", "lvchange":
 		how = syscall.LOCK_EX
+	}
+	if d, err := time.ParseDuration(os.Getenv(envWriteDelay)); how == syscall.LOCK_EX && err == nil && d > 0 {
+		time.Sleep(d)
+	} else {
+		sleepEnv(envDelay)
 	}
 	statePath := os.Getenv(envState)
 	unlock, err := lock(statePath+".lock", how)
