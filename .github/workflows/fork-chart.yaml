@@ -1,0 +1,68 @@
+# Packages charts/topolvm (with its cert-manager dependency, as upstream's
+# release does) and pushes it as an OCI chart to this repository owner's
+# GitHub Container Registry namespace, oci://ghcr.io/<owner>/charts/topolvm.
+#
+# Trigger with a tag named topolvm-chart-v<chart version>, for example
+# topolvm-chart-v17.3.1-fast.1; the version must match charts/topolvm/Chart.yaml.
+name: "Fork chart"
+
+on:
+  push:
+    tags:
+      - "topolvm-chart-v*-fast.*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  chart:
+    name: "package and push chart"
+    runs-on: "ubuntu-24.04"
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: "Install Helm"
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: "v3.22.0"
+      - name: "Check version"
+        id: version
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          VERSION=$(sed -n 's/^version: //p' charts/topolvm/Chart.yaml)
+          if [ "${REF_TYPE}" = "tag" ] && [ "${REF_NAME}" != "topolvm-chart-v${VERSION}" ]; then
+            echo "::error::tag ${REF_NAME} does not match chart version ${VERSION}"
+            exit 1
+          fi
+          OWNER=$(printf '%s' "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')
+          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
+          echo "registry=oci://ghcr.io/${OWNER}/charts" >> "${GITHUB_OUTPUT}"
+      - name: "Package"
+        run: |
+          helm repo add jetstack https://charts.jetstack.io
+          helm dependency build charts/topolvm
+          helm package charts/topolvm --destination /tmp/chart
+      - name: "Push"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.version.outputs.version }}
+          REGISTRY: ${{ steps.version.outputs.registry }}
+        run: |
+          printf '%s' "$GITHUB_TOKEN" | helm registry login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          helm push "/tmp/chart/topolvm-${VERSION}.tgz" "${REGISTRY}" 2>&1 | tee /tmp/push.log
+          DIGEST=$(sed -n 's/^Digest: //p' /tmp/push.log)
+          {
+            echo "### Chart"
+            echo
+            echo "\`${REGISTRY}/topolvm:${VERSION}@${DIGEST}\`"
+            echo
+            echo "Built from \`${GITHUB_SHA}\`."
+          } >> "${GITHUB_STEP_SUMMARY}"
