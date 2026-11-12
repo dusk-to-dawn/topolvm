@@ -37,6 +37,13 @@ def main(name, out):
         print("| " + " | ".join(str(r.get(k)) for k, _ in COLUMNS) + f" | `{cmds}` |")
         tsv.append("\t".join([name] + [str(r.get(k)) for k, _ in COLUMNS] + [cmds]))
     Path(out, "summary.tsv").write_text("\n".join(tsv) + "\n")
+    for limit in sorted(Path(out).glob("*/limit.json")):
+        r = json.loads(limit.read_text())
+        verdict = "OVERCOMMIT" if r["overcommit"] else "within the limit"
+        print(f"\nOver-capacity round {r['round']}: {r['claims']} staggered claims of {r['claim_size']}, "
+              f"{r['stagger_ms']} ms apart; thin volumes reached at most {r['max_thin_bytes']} of "
+              f"{r['limit_bytes']} bytes ({verdict}); {r['volumes_created']} volumes created; "
+              f"{r['samples']} samples.")
     env = Path(out, "env.txt")
     if env.exists():
         print("\n```\n" + env.read_text() + "```\n")

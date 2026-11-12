@@ -13,14 +13,20 @@
 #   PROVISIONER_ARGS space-separated extra csi-provisioner arguments
 #                (needs a chart with controller.csiProvisioner.args)
 #   SIZES        volume counts per round, e.g. "1 12 40"
-#   MODES        "pods", "pvc" or both (see the round loop)
+#   MODES        any of "pods", "pvc" and "stagger" (see the round loop)
+#   STAGGER_MS   interval between claims in "stagger" rounds and the limit round
+#   LIMIT_CLAIMS claims of LIMIT_SIZE in the over-capacity round (0: skip it)
+#   LIMIT_SIZE   size of those claims; their sum must exceed the pool's limit
 #   REPEATS      rounds per size
 #   OUT          output directory
 set -euo pipefail
 
 : "${SRC:?}" "${CHART:?}" "${IMAGE_MODE:?}" "${OUT:?}"
 SIZES=${SIZES:-"1 12 40"}
-MODES=${MODES:-"pods pvc"}
+MODES=${MODES:-"pods pvc stagger"}
+STAGGER_MS=${STAGGER_MS:-150}
+LIMIT_CLAIMS=${LIMIT_CLAIMS:-40}
+LIMIT_SIZE=${LIMIT_SIZE:-3Gi}
 REPEATS=${REPEATS:-2}
 NODE_ARGS=${NODE_ARGS:-}
 LVMD_ARGS=${LVMD_ARGS:-}
@@ -158,9 +164,9 @@ done
 } > "$OUT/env.txt"
 cat "$OUT/env.txt" >&2
 
-object_manifest() { # mode round index
-  local mode=$1 round=$2 i=$3
-  if [ "$mode" = pvc ]; then
+object_manifest() { # mode round index [size]
+  local mode=$1 round=$2 i=$3 size=${4:-1Gi}
+  if [ "$mode" != pods ]; then
     cat <<EOF
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -177,7 +183,7 @@ spec:
   storageClassName: bench-thin
   resources:
     requests:
-      storage: 1Gi
+      storage: $size
 EOF
   else
     cat <<EOF
@@ -216,11 +222,37 @@ EOF
 
 lv_count() { "$KUBECTL" get logicalvolumes.topolvm.io --no-headers 2>/dev/null | wc -l; }
 
+# create_staggered rdir round count size: creates count claims, one every
+# STAGGER_MS, each by its own kubectl process.
+create_staggered() {
+  local rdir=$1 round=$2 count=$3 size=$4 i pids="" pause
+  pause=$(awk -v ms="$STAGGER_MS" 'BEGIN { printf "%.3f", ms / 1000 }')
+  mkdir -p "$rdir/staggered"
+  for i in $(seq -w 1 "$count"); do
+    object_manifest stagger "$round" "$i" "$size" > "$rdir/staggered/$i.yaml"
+  done
+  for i in $(seq -w 1 "$count"); do
+    "$KUBECTL" create -f "$rdir/staggered/$i.yaml" >/dev/null &
+    pids="$pids $!"
+    sleep "$pause"
+  done
+  # shellcheck disable=SC2086
+  wait $pids
+}
+
+# thin_sum: bytes of all thin volumes in node 1's pool, as LVM reports them.
+thin_sum() {
+  sudo lvs --noheadings --units b --nosuffix -o lv_size -S 'pool_lv=pool0' node1-bench 2>/dev/null \
+    | awk '{ s += $1 } END { printf "%d\n", s }'
+}
+
 # Modes: "pods" creates Pods with a generic ephemeral block volume each, pinned
 # to one node (the claims pass through the ephemeral volume controller and the
 # scheduler); "pvc" creates claims that already carry the selected-node
 # annotation the scheduler would set, so provisioning starts at once and no
-# Pod, kubelet or NodePublishVolume call is involved.
+# Pod, kubelet or NodePublishVolume call is involved; "stagger" creates the
+# same claims one at a time, STAGGER_MS apart, as the claims of a CI burst
+# arrive.
 for mode in $MODES; do
   for size in $SIZES; do
     for rep in $(seq "$REPEATS"); do
@@ -238,12 +270,16 @@ for mode in $MODES; do
       log "round $round: create $size objects"
       t0=$(date -u +%s.%N)
       pids=""
-      for f in "$rdir"/objects/chunk*.yaml; do
-        "$KUBECTL" create -f "$f" >/dev/null &
-        pids="$pids $!"
-      done
-      # shellcheck disable=SC2086
-      wait $pids
+      if [ "$mode" = stagger ]; then
+        create_staggered "$rdir" "$round" "$size" 1Gi
+      else
+        for f in "$rdir"/objects/chunk*.yaml; do
+          "$KUBECTL" create -f "$f" >/dev/null &
+          pids="$pids $!"
+        done
+        # shellcheck disable=SC2086
+        wait $pids
+      fi
       t_created=$(date -u +%s.%N)
       deadline=$(( $(date +%s) + 300 ))
       while :; do
@@ -283,6 +319,60 @@ EOF
   done
 done
 
+# Over-capacity round: staggered claims that together ask for more than the
+# thin pool's limit (pool size times the overprovision ratio of 10). A
+# sampler records the largest sum of thin volume sizes while they arrive; it
+# must never exceed the limit.
+LIMIT_FAILED=0
+if [ "$LIMIT_CLAIMS" -gt 0 ]; then
+  round="limit-n$LIMIT_CLAIMS"
+  rdir="$OUT/$round"
+  mkdir -p "$rdir"
+  pool_bytes=$(sudo lvs --noheadings --units b --nosuffix -o lv_size node1-bench/pool0 | tr -d ' ')
+  limit_bytes=$((pool_bytes * 10))
+  log "round $round: $LIMIT_CLAIMS claims of $LIMIT_SIZE against a limit of $limit_bytes bytes"
+  ( while :; do thin_sum; sleep 0.2; done ) > "$rdir/samples.txt" &
+  sampler=$!
+  t0=$(date -u +%s.%N)
+  create_staggered "$rdir" "$round" "$LIMIT_CLAIMS" "$LIMIT_SIZE"
+  # Wait until no LogicalVolume has been added for 15 s.
+  last=-1
+  stable_since=$(date +%s)
+  deadline=$(( $(date +%s) + 240 ))
+  while :; do
+    n=$(lv_count)
+    if [ "$n" != "$last" ]; then last=$n; stable_since=$(date +%s); fi
+    [ $(( $(date +%s) - stable_since )) -ge 15 ] && break
+    [ "$(date +%s)" -gt "$deadline" ] && break
+    sleep 1
+  done
+  sleep 3
+  kill "$sampler" 2>/dev/null || true
+  wait "$sampler" 2>/dev/null || true
+  thin_sum >> "$rdir/samples.txt"
+  created=$(sudo lvs --noheadings -o lv_name -S 'pool_lv=pool0' node1-bench | wc -l)
+  max_bytes=$(sort -n "$rdir/samples.txt" | tail -n 1)
+  since=$(date -u -d "@${t0%.*}" +%Y-%m-%dT%H:%M:%SZ)
+  exhausted=$("$KUBECTL" logs -n topolvm-system deploy/topolvm-controller -c csi-provisioner --since-time="$since" \
+    | grep -c 'ResourceExhausted' || true)
+  overcommit=false
+  if [ "$max_bytes" -gt "$limit_bytes" ]; then overcommit=true; fi
+  printf '{"round": "%s", "claims": %d, "claim_size": "%s", "stagger_ms": %d, "pool_bytes": %d, "limit_bytes": %d, "max_thin_bytes": %d, "samples": %d, "volumes_created": %d, "resource_exhausted_log_lines": %d, "overcommit": %s}\n' \
+    "$round" "$LIMIT_CLAIMS" "$LIMIT_SIZE" "$STAGGER_MS" "$pool_bytes" "$limit_bytes" "$max_bytes" \
+    "$(wc -l < "$rdir/samples.txt")" "$created" "$exhausted" "$overcommit" > "$rdir/limit.json"
+  cat "$rdir/limit.json" >&2
+  "$KUBECTL" delete pvc -n "$NS" -l "bench=$round" --wait=false >/dev/null
+  deadline=$(( $(date +%s) + 300 ))
+  while [ "$(lv_count)" -gt 0 ]; do
+    if [ "$(date +%s)" -gt "$deadline" ]; then log "round $round: deletion timeout"; break; fi
+    sleep 0.5
+  done
+  if [ "$overcommit" = true ]; then
+    log "round $round: OVERCOMMIT: thin volumes reached $max_bytes bytes, limit $limit_bytes"
+    LIMIT_FAILED=1
+  fi
+fi
+
 sudo journalctl -u lvmd1.service -o cat --since "@${T_START}" > "$OUT/lvmd1-full.log" || true
 "$KUBECTL" logs -n topolvm-system "$NODE_POD" -c topolvm-node --timestamps > "$OUT/node-full.log" || true
 
@@ -298,3 +388,7 @@ for i in 1 2 3; do
   sudo losetup -d "$dev"
   rm -f "$WORK/backing$i"
 done
+
+if [ "$LIMIT_FAILED" = 1 ]; then
+  exit 1
+fi
