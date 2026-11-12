@@ -30,6 +30,7 @@ import (
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	ctrlconfig "sigs.k8s.io/controller-runtime/pkg/config"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
@@ -37,6 +38,10 @@ import (
 	"sigs.k8s.io/yaml"
 	//+kubebuilder:scaffold:imports
 )
+
+// maxConcurrentReconcilesLimit bounds --max-concurrent-reconciles. Each
+// worker can wait on one lvmd call, and lvmd bounds its own lvm commands.
+const maxConcurrentReconcilesLimit = 64
 
 var (
 	scheme      = runtime.NewScheme()
@@ -62,6 +67,10 @@ func subMain(ctx context.Context) error {
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&config.zapOpts)))
 
+	if config.maxConcurrentRec < 1 || config.maxConcurrentRec > maxConcurrentReconcilesLimit {
+		return fmt.Errorf("--max-concurrent-reconciles must be between 1 and %d", maxConcurrentReconcilesLimit)
+	}
+
 	metricsServerOptions := metricsserver.Options{
 		BindAddress: config.metricsAddr,
 	}
@@ -75,6 +84,10 @@ func subMain(ctx context.Context) error {
 		Metrics:          metricsServerOptions,
 		LeaderElection:   false,
 		PprofBindAddress: config.profilingBindAddress,
+		// The LogicalVolume reconciler is this manager's only controller.
+		Controller: ctrlconfig.Controller{
+			MaxConcurrentReconciles: config.maxConcurrentRec,
+		},
 	})
 	if err != nil {
 		setupLog.Error(err, "unable to start manager")

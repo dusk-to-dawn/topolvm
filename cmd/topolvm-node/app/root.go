@@ -24,6 +24,7 @@ var config struct {
 	embedLvmd            bool
 	lvmPath              string
 	maxConcurrentLVM     int
+	maxConcurrentRec     int
 	lvmd                 lvmd.Config
 	profilingBindAddress string
 }
@@ -63,6 +64,7 @@ func init() {
 	fs.String("nodename", "", "The resource name of the running node")
 	fs.BoolVar(&config.embedLvmd, "embed-lvmd", false, "Runs LVMD locally by embedding it instead of calling it externally via gRPC")
 	fs.StringVar(&config.lvmPath, "lvm-path", "", "lvm command path on the host OS. This is deprecated and users should use lvm-command-prefix setting instead.")
+	fs.IntVar(&config.maxConcurrentRec, "max-concurrent-reconciles", 1, fmt.Sprintf("maximum number of LogicalVolumes to create, resize or remove at once (1 to %d)", maxConcurrentReconcilesLimit))
 	fs.IntVar(&config.maxConcurrentLVM, "max-concurrent-lvm-commands", lvmdcommand.DefaultMaxConcurrentCommands, "maximum number of lvm commands the embedded lvmd runs at once (with --embed-lvmd); further calls wait for one to finish. 0 means no limit")
 	fs.StringVar(&cfgFilePath, "config", filepath.Join("/etc", "topolvm", "lvmd.yaml"), "config file")
 	fs.StringVar(&config.profilingBindAddress, "profiling-bind-address", "", "Bind pprof profiling to the given network address. If empty, profiling is disabled.")

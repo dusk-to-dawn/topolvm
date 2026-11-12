@@ -108,6 +108,7 @@ to clean up PVCs and associated Pods bound to the node.
 | `metrics-bind-address` | string | `:8080`                         | Bind address for the metrics endpoint. |
 | `secure-metrics-server`| bool   | `false`                         | Secures the metrics server.            |
 | `nodename`             | string |                                 | `Node` resource name.                  |
+| `max-concurrent-reconciles` | int | `1`                             | Maximum number of LogicalVolumes created, resized or removed at once (1 to 64). |
 | `max-concurrent-lvm-commands` | int | `16`                          | With `embed-lvmd`, the maximum number of `lvm` commands run at once. `0` means no limit. |
 
 ## Environment Variables
