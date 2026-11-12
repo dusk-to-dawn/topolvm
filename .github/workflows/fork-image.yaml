@@ -1,0 +1,150 @@
+# Builds the topolvm-with-sidecar image of this branch for linux/amd64 with
+# upstream's Dockerfile and bake target, and pushes it to this repository
+# owner's GitHub Container Registry namespace.
+#
+# Trigger with a tag named image-<version>, for example image-0.42.1-fast.2,
+# which publishes ghcr.io/<owner>/topolvm-with-sidecar:0.42.1-fast.2. The tag
+# deliberately does not start with "v": upstream's release workflow runs on
+# tags matching v*. A version that already exists is never overwritten.
+#
+# Pinned here: the actions (by commit), BuildKit and the two base images of
+# the Dockerfile (by digest, through bake's named contexts). Not pinned:
+# Ubuntu packages installed at build time, and the CSI sidecar sources, which
+# upstream's csi-sidecars.mk downloads by version tag without a checksum.
+name: "Fork image"
+
+on:
+  push:
+    tags:
+      - "image-*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Image tag and TOPOLVM_VERSION, e.g. 0.42.1-fast.2"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  BUILDKIT_IMAGE: "moby/buildkit:buildx-stable-1@sha256:c5f8862f52499773af85bc07695b2379ef08e8002352b0df2c4864c91d78dabe"
+  GOLANG_IMAGE: "docker-image://golang:1.26-bookworm@sha256:dc40a13b61304647ed7e5d581d246b86413dfc29d63c6d018310feb93cd98fc0"
+  UBUNTU_IMAGE: "docker-image://ubuntu:22.04@sha256:74b12b11ffa550fba1929ad4d8d16533c34f6612728469671afba1b03b66881c"
+
+jobs:
+  image:
+    name: "build and push topolvm-with-sidecar (linux/amd64)"
+    runs-on: "ubuntu-24.04"
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: "Resolve version"
+        id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          if [ "${REF_TYPE}" = "tag" ]; then
+            VERSION="${REF_NAME#image-}"
+          else
+            VERSION="${INPUT_VERSION}"
+          fi
+          if ! printf '%s' "${VERSION}" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+-[0-9A-Za-z.]+$'; then
+            echo "::error::version must look like 0.42.1-fast.2, got '${VERSION}'"
+            exit 1
+          fi
+          OWNER=$(printf '%s' "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')
+          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
+          echo "prefix=ghcr.io/${OWNER}/" >> "${GITHUB_OUTPUT}"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          driver-opts: image=${{ env.BUILDKIT_IMAGE }}
+      - name: Login registry
+        run: printf '%s' "$GITHUB_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Refuse to overwrite an existing version
+        env:
+          REF: ${{ steps.version.outputs.prefix }}topolvm-with-sidecar:${{ steps.version.outputs.version }}
+        run: |
+          if out=$(docker buildx imagetools inspect "${REF}" 2>&1); then
+            echo "::error::${REF} exists already; publish a new version instead"
+            exit 1
+          fi
+          case "${out}" in
+            *"not found"*|*"MANIFEST_UNKNOWN"*|*"manifest unknown"*) echo "${REF} does not exist yet" ;;
+            *) echo "::error::cannot tell whether ${REF} exists: ${out}"; exit 1 ;;
+          esac
+      - name: Pin base images and label the image
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          jq -n \
+            --arg golang "${GOLANG_IMAGE}" --arg ubuntu "${UBUNTU_IMAGE}" \
+            --arg rev "${GITHUB_SHA}" --arg src "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" --arg ver "${VERSION}" \
+            '{target: {"topolvm-with-sidecar": {
+                contexts: {"golang:1.26-bookworm": $golang, "ubuntu:22.04": $ubuntu},
+                labels: {"org.opencontainers.image.revision": $rev,
+                         "org.opencontainers.image.source": $src,
+                         "org.opencontainers.image.version": $ver}}}}' > /tmp/fork-pins.json
+          cat /tmp/fork-pins.json
+      - name: Show the resolved build
+        env:
+          IMAGE_PREFIX: ${{ steps.version.outputs.prefix }}
+          IMAGE_TAG: ${{ steps.version.outputs.version }}
+          TOPOLVM_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          docker buildx bake --print \
+            -f docker-bake.hcl -f /tmp/fork-pins.json \
+            --set 'topolvm-with-sidecar.platform=linux/amd64' \
+            topolvm-with-sidecar
+      - name: Build and push
+        env:
+          IMAGE_PREFIX: ${{ steps.version.outputs.prefix }}
+          IMAGE_TAG: ${{ steps.version.outputs.version }}
+          TOPOLVM_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          docker buildx bake --no-cache --push \
+            -f docker-bake.hcl -f /tmp/fork-pins.json \
+            --set 'topolvm-with-sidecar.platform=linux/amd64' \
+            --metadata-file /tmp/bake-metadata.json \
+            topolvm-with-sidecar
+      - name: Report digest
+        env:
+          IMAGE_PREFIX: ${{ steps.version.outputs.prefix }}
+          IMAGE_TAG: ${{ steps.version.outputs.version }}
+        run: |
+          DIGEST=$(jq -r '."topolvm-with-sidecar"."containerimage.digest"' /tmp/bake-metadata.json)
+          REF="${IMAGE_PREFIX}topolvm-with-sidecar:${IMAGE_TAG}@${DIGEST}"
+          echo "image: ${REF}"
+          {
+            echo "### Image"
+            echo
+            echo "\`${REF}\`"
+            echo
+            echo "Built from \`${GITHUB_SHA}\`."
+          } >> "${GITHUB_STEP_SUMMARY}"
+          echo "REF=${REF}" >> "${GITHUB_ENV}"
+      - name: Report component versions
+        run: |
+          {
+            echo
+            echo "### Component versions"
+            echo
+            echo '```'
+            printf '/lvmd: '
+            docker run --rm --entrypoint /lvmd "${REF}" --version 2>&1 | head -n 1
+            for bin in /csi-provisioner /csi-resizer /csi-snapshotter /csi-node-driver-registrar /livenessprobe; do
+              printf '%s: ' "${bin}"
+              docker run --rm --entrypoint "${bin}" "${REF}" --version 2>&1 | head -n 1
+            done
+            echo '```'
+          } | tee -a "${GITHUB_STEP_SUMMARY}"
