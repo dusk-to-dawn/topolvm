@@ -19,10 +19,21 @@ def ts(value):
     return datetime.fromisoformat(value).replace(tzinfo=timezone.utc).timestamp()
 
 
+# The report sent to watchers after a change is a fullreport of all volume
+# groups; a fullreport that names a volume group belongs to a request.
+WATCH_REPORT = "fullreport"
+SCOPED_REPORT = "fullreport <vg>"
+
+
 def lvm_subcommand(args):
     for i, a in enumerate(args):
         if a == "lvm" or a.endswith("/lvm"):
-            return args[i + 1] if i + 1 < len(args) else "?"
+            rest = args[i + 1:]
+            if not rest:
+                return "?"
+            if rest[0] == "fullreport" and len(rest) > 1 and not rest[1].startswith("-"):
+                return SCOPED_REPORT
+            return rest[0]
     return args[0] if args else "?"
 
 
@@ -96,7 +107,7 @@ def main(rdir):
     removed = [t for t in lvmd_times(rdir / "lvmd-delete.log", "removed a LV") if t >= times["t_del"]]
 
     def per_volume(counts, n, include_full):
-        total = sum(v for k, v in counts.items() if include_full or k != "fullreport")
+        total = sum(v for k, v in counts.items() if include_full or k != WATCH_REPORT)
         return round(total / n, 2) if n else None
 
     def rel(t):
@@ -120,7 +131,7 @@ def main(rdir):
         "all_bound_seen_s": rel(times["t_bound"]),
         "lvm_commands_create_window": create_cmds,
         "lvm_per_volume_excl_fullreport": per_volume(create_cmds, len(lvmd_created), False),
-        "fullreports_create_window": create_cmds.get("fullreport", 0),
+        "fullreports_create_window": create_cmds.get(WATCH_REPORT, 0),
         "delete_all_lvs_gone_s": round(times["t_deleted"] - times["t_del"], 3),
         "last_lvmd_removed_s": round(max(removed) - times["t_del"], 3) if removed else None,
         "lvm_commands_delete_window": delete_cmds,

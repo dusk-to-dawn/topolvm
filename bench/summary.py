@@ -15,7 +15,7 @@ COLUMNS = [
     ("claim_start_to_succeeded_s_median", "claim median s"),
     ("claim_start_to_succeeded_s_max", "claim max s"),
     ("lvm_per_volume_excl_fullreport", "lvm per create"),
-    ("fullreports_create_window", "fullreports"),
+    ("fullreports_create_window", "watch fullreports"),
     ("delete_all_lvs_gone_s", "all LVs gone s"),
     ("lvm_per_removal_excl_fullreport", "lvm per removal"),
 ]
