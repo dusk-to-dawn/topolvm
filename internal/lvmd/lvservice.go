@@ -48,6 +48,18 @@ func (s *lvService) CreateLV(ctx context.Context, req *proto.CreateLVRequest) (*
 	}
 	oc := s.ocmapper.LvcreateOptionClass(req.LvcreateOptionClass)
 
+	// The volume can exist already, for example when the caller stopped after
+	// creating it but before recording that. Report it as AlreadyExists, from
+	// the report taken above, instead of failing in lvcreate, so that callers
+	// do not need to list the volumes before every creation.
+	existing, err := pool.FindVolume(ctx, req.GetName())
+	switch {
+	case err == nil && (dc.Type != lvmdTypes.TypeThick || !existing.IsThin()):
+		return nil, status.Errorf(codes.AlreadyExists, "logical volume %s already exists", req.GetName())
+	case err != nil && !errors.Is(err, command.ErrNotFound):
+		return nil, status.Errorf(codes.Internal, "failed to look up volume: %v", err)
+	}
+
 	requested := uint64(req.GetSizeBytes())
 	free, err := pool.Free(ctx)
 	if err != nil {

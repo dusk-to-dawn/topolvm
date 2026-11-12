@@ -146,6 +146,17 @@ func TestLVMCommandsPerCall(t *testing.T) {
 				}
 			})
 
+			t.Run("CreateLV of an existing volume", func(t *testing.T) {
+				f.lvm.Reset(t)
+				_, err := f.lv.CreateLV(ctx, &proto.CreateLVRequest{
+					Name: "new-" + dc, DeviceClass: dc, SizeBytes: int64(fakeGiB),
+				})
+				if status.Code(err) != codes.AlreadyExists {
+					t.Errorf("got %v, want AlreadyExists", err)
+				}
+				expectCommands(t, f, []string{"fullreport"})
+			})
+
 			t.Run("ResizeLV", func(t *testing.T) {
 				f.lvm.Reset(t)
 				res, err := f.lv.ResizeLV(ctx, &proto.ResizeLVRequest{

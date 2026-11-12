@@ -2,6 +2,8 @@ package controller
 
 import (
 	"context"
+	"slices"
+	"sync"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -10,6 +12,8 @@ import (
 	topolvmv1 "github.com/topolvm/topolvm/api/v1"
 	"github.com/topolvm/topolvm/pkg/lvmd/proto"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
 	storegev1 "k8s.io/api/storage/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -21,7 +25,25 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/metrics/server"
 )
 
-var volumes = &[]*proto.LogicalVolume{}
+// mockLVMD holds the state shared by the mock lvmd clients below.
+var mockLVMD = struct {
+	sync.Mutex
+	volumes      []*proto.LogicalVolume
+	getLVListN   int
+	createLVHook func(in *proto.CreateLVRequest) error
+}{}
+
+func mockLVMDGetLVListCalls() int {
+	mockLVMD.Lock()
+	defer mockLVMD.Unlock()
+	return mockLVMD.getLVListN
+}
+
+func setMockCreateLVHook(hook func(in *proto.CreateLVRequest) error) {
+	mockLVMD.Lock()
+	defer mockLVMD.Unlock()
+	mockLVMD.createLVHook = hook
+}
 
 type MockVGServiceClient struct {
 }
@@ -33,8 +55,11 @@ func (MockVGServiceClient) GetFreeBytes(ctx context.Context, in *proto.GetFreeBy
 
 // GetLVList implements proto.VGServiceClient.
 func (c MockVGServiceClient) GetLVList(ctx context.Context, in *proto.GetLVListRequest, opts ...grpc.CallOption) (*proto.GetLVListResponse, error) {
+	mockLVMD.Lock()
+	defer mockLVMD.Unlock()
+	mockLVMD.getLVListN++
 	return &proto.GetLVListResponse{
-		Volumes: *volumes,
+		Volumes: slices.Clone(mockLVMD.volumes),
 	}, nil
 }
 
@@ -48,11 +73,18 @@ type MockLVServiceClient struct {
 
 // CreateLV implements proto.LVServiceClient.
 func (c MockLVServiceClient) CreateLV(ctx context.Context, in *proto.CreateLVRequest, opts ...grpc.CallOption) (*proto.CreateLVResponse, error) {
+	mockLVMD.Lock()
+	defer mockLVMD.Unlock()
 	lv := proto.LogicalVolume{
 		Name:      in.Name,
 		SizeBytes: in.SizeBytes,
 	}
-	*volumes = append(*volumes, &lv)
+	mockLVMD.volumes = append(mockLVMD.volumes, &lv)
+	if mockLVMD.createLVHook != nil {
+		if err := mockLVMD.createLVHook(in); err != nil {
+			return nil, err
+		}
+	}
 	createResponse := proto.CreateLVResponse{
 		Volume: &lv,
 	}
@@ -71,7 +103,7 @@ func (MockLVServiceClient) RemoveLV(ctx context.Context, in *proto.RemoveLVReque
 
 // ResizeLV implements proto.LVServiceClient.
 func (MockLVServiceClient) ResizeLV(ctx context.Context, in *proto.ResizeLVRequest, opts ...grpc.CallOption) (*proto.ResizeLVResponse, error) {
-	panic("unimplemented")
+	return &proto.ResizeLVResponse{SizeBytes: in.SizeBytes}, nil
 }
 
 var _ = Describe("LogicalVolume controller", func() {
@@ -228,5 +260,66 @@ var _ = Describe("LogicalVolume controller", func() {
 			}
 			return !controllerutil.ContainsFinalizer(&lv, topolvm.GetLogicalVolumeFinalizer())
 		}, "2s").Should(BeTrue())
+	})
+	waitForVolumeID := func(ctx context.Context, lv *topolvmv1.LogicalVolume) {
+		GinkgoHelper()
+		Eventually(func(g Gomega) {
+			g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(lv), lv)).To(Succeed())
+			g.Expect(lv.Status.VolumeID).To(Equal(string(lv.UID)))
+			g.Expect(lv.Status.Code).To(Equal(codes.OK))
+		}).Should(Succeed())
+	}
+
+	It("should create LV without listing the volumes first", func() {
+		setMockCreateLVHook(nil)
+		startReconciler("-create")
+		ctx := context.Background()
+		before := mockLVMDGetLVListCalls()
+
+		lv := setupResources(ctx, "-create")
+		waitForVolumeID(ctx, &lv)
+		Expect(lv.Status.CurrentSize).NotTo(BeNil())
+		Expect(mockLVMDGetLVListCalls()).To(Equal(before))
+	})
+
+	It("should adopt an existing LV that lvmd reports as AlreadyExists", func() {
+		setMockCreateLVHook(func(in *proto.CreateLVRequest) error {
+			return status.Error(codes.AlreadyExists, "exists")
+		})
+		DeferCleanup(func() { setMockCreateLVHook(nil) })
+		startReconciler("-already-exists")
+		ctx := context.Background()
+
+		lv := setupResources(ctx, "-already-exists")
+		waitForVolumeID(ctx, &lv)
+	})
+
+	It("should adopt an existing LV when an older lvmd fails to create it", func() {
+		setMockCreateLVHook(func(in *proto.CreateLVRequest) error {
+			return status.Error(codes.Internal, "Logical Volume already exists in volume group")
+		})
+		DeferCleanup(func() { setMockCreateLVHook(nil) })
+		startReconciler("-old-lvmd")
+		ctx := context.Background()
+
+		lv := setupResources(ctx, "-old-lvmd")
+		waitForVolumeID(ctx, &lv)
+	})
+
+	It("should record the error when creation fails and the LV does not exist", func() {
+		setMockCreateLVHook(func(in *proto.CreateLVRequest) error {
+			mockLVMD.volumes = slices.DeleteFunc(mockLVMD.volumes, func(v *proto.LogicalVolume) bool { return v.Name == in.Name })
+			return status.Error(codes.ResourceExhausted, "no space")
+		})
+		DeferCleanup(func() { setMockCreateLVHook(nil) })
+		startReconciler("-fail")
+		ctx := context.Background()
+
+		lv := setupResources(ctx, "-fail")
+		Eventually(func(g Gomega) {
+			g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(&lv), &lv)).To(Succeed())
+			g.Expect(lv.Status.Code).To(Equal(codes.ResourceExhausted))
+			g.Expect(lv.Status.VolumeID).To(BeEmpty())
+		}).Should(Succeed())
 	})
 })
