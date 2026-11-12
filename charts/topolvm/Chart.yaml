@@ -20,3 +20,4 @@ annotations:
   artifacthub.io/images: |
     - name: topolvm-with-sidecar
       image: ghcr.io/dusk-to-dawn/topolvm-with-sidecar:0.42.1-fast.1
+  artifacthub.io/license: Apache-2.0
