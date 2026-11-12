@@ -1,0 +1,132 @@
+# Burst provisioning check: thin block volumes requested at once on one node
+# of a kind cluster, with lvmd on loop devices of the runner as in the e2e
+# suite. Configurations live in bench/matrix.json.
+name: "Bench"
+
+on:
+  push:
+    branches:
+      - "bench"
+  workflow_dispatch:
+    inputs:
+      configs:
+        description: "Comma-separated config names (empty: all enabled)"
+        required: false
+        type: string
+      build_ref:
+        description: "Ref to use for configs whose image_mode is build (empty: as in matrix.json)"
+        required: false
+        type: string
+      sizes:
+        description: "Volume counts per round"
+        required: false
+        default: "12 40"
+        type: string
+      repeats:
+        description: "Rounds per size"
+        required: false
+        default: "2"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    runs-on: "ubuntu-24.04"
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: plan
+        env:
+          CONFIGS: ${{ inputs.configs }}
+          BUILD_REF: ${{ inputs.build_ref }}
+        run: |
+          python3 - <<'EOF' >> "$GITHUB_OUTPUT"
+          import json, os
+          entries = json.load(open("bench/matrix.json"))
+          wanted = [c.strip() for c in os.environ.get("CONFIGS", "").split(",") if c.strip()]
+          build_ref = os.environ.get("BUILD_REF", "").strip()
+          out = []
+          for e in entries:
+              if wanted:
+                  if e["name"] not in wanted:
+                      continue
+              elif not e.get("enabled"):
+                  continue
+              if build_ref and e["image_mode"] == "build":
+                  e["src_ref"] = build_ref
+              out.append(e)
+          print("matrix=" + json.dumps({"include": out}))
+          EOF
+
+  bench:
+    needs: plan
+    name: "${{ matrix.name }}"
+    runs-on: "ubuntu-22.04"
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          path: harness
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ matrix.src_ref }}
+          path: src
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ matrix.chart_ref }}
+          path: chart
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: "src/go.mod"
+          cache-dependency-path: "src/go.sum"
+      - name: Record refs
+        run: |
+          {
+            echo "### ${{ matrix.name }}"
+            echo
+            echo "- src: \`${{ matrix.src_ref }}\` = \`$(git -C src rev-parse HEAD)\`"
+            echo "- chart: \`${{ matrix.chart_ref }}\` = \`$(git -C chart rev-parse HEAD)\`"
+            echo "- image mode: ${{ matrix.image_mode }} ${{ matrix.image }}"
+            echo "- topolvm-node args: \`${{ matrix.node_args }}\`"
+            echo "- lvmd args: \`${{ matrix.lvmd_args }}\`"
+            echo "- csi-provisioner args: \`${{ matrix.provisioner_args }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Run rounds
+        env:
+          SRC: ${{ github.workspace }}/src
+          CHART: ${{ github.workspace }}/chart
+          OUT: ${{ github.workspace }}/out/${{ matrix.name }}
+          IMAGE_MODE: ${{ matrix.image_mode }}
+          IMAGE: ${{ matrix.image }}
+          SIDECAR_IMAGE: "ghcr.io/topolvm/topolvm-with-sidecar:0.42.1"
+          NODE_ARGS: ${{ matrix.node_args }}
+          LVMD_ARGS: ${{ matrix.lvmd_args }}
+          PROVISIONER_ARGS: ${{ matrix.provisioner_args }}
+          SIZES: ${{ inputs.sizes || '12 40' }}
+          REPEATS: ${{ inputs.repeats || '2' }}
+        run: ./harness/bench/run.sh
+      - name: Summary
+        if: always()
+        env:
+          OUT: ${{ github.workspace }}/out/${{ matrix.name }}
+          NAME: ${{ matrix.name }}
+        run: python3 harness/bench/summary.py "$NAME" "$OUT" >> "$GITHUB_STEP_SUMMARY" || true
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: bench-${{ matrix.name }}
+          path: out/
+          retention-days: 14
