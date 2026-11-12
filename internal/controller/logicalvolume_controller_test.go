@@ -376,4 +376,40 @@ var _ = Describe("LogicalVolume controller", func() {
 		defer mu.Unlock()
 		Expect(peak).To(Equal(workers))
 	})
+	It("should add the finalizer and label before creating the LV, in the same pass", func() {
+		var mu sync.Mutex
+		var problems []string
+		setMockCreateLVHook(func(in *proto.CreateLVRequest) error {
+			// The hook runs with the mock's lock held; the API read below does not need it.
+			var list topolvmv1.LogicalVolumeList
+			if err := k8sClient.List(context.Background(), &list); err != nil {
+				return err
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			for _, lv := range list.Items {
+				if string(lv.UID) != in.Name {
+					continue
+				}
+				if !controllerutil.ContainsFinalizer(&lv, topolvm.GetLogicalVolumeFinalizer()) {
+					problems = append(problems, "no finalizer when CreateLV was called")
+				}
+				if lv.Labels[topolvm.CreatedbyLabelKey] != topolvm.CreatedbyLabelValue {
+					problems = append(problems, "no label when CreateLV was called")
+				}
+			}
+			return nil
+		})
+		DeferCleanup(func() { setMockCreateLVHook(nil) })
+		startReconciler("-one-pass")
+		ctx := context.Background()
+
+		lv := setupResources(ctx, "-one-pass")
+		waitForVolumeID(ctx, &lv)
+		Expect(controllerutil.ContainsFinalizer(&lv, topolvm.GetLogicalVolumeFinalizer())).To(BeTrue())
+		Expect(lv.Labels).To(HaveKeyWithValue(topolvm.CreatedbyLabelKey, topolvm.CreatedbyLabelValue))
+		mu.Lock()
+		defer mu.Unlock()
+		Expect(problems).To(BeEmpty())
+	})
 })

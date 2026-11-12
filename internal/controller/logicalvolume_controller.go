@@ -71,29 +71,22 @@ func (r *LogicalVolumeReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	}
 
 	if lv.DeletionTimestamp == nil {
-		if !controllerutil.ContainsFinalizer(lv, topolvm.GetLogicalVolumeFinalizer()) {
+		if !controllerutil.ContainsFinalizer(lv, topolvm.GetLogicalVolumeFinalizer()) ||
+			!containsKeyAndValue(lv.Labels, topolvm.CreatedbyLabelKey, topolvm.CreatedbyLabelValue) {
+			// Add the finalizer and the label with one patch, and go on with the
+			// patched object: the finalizer is in place before the LV exists.
 			lv2 := lv.DeepCopy()
 			controllerutil.AddFinalizer(lv2, topolvm.GetLogicalVolumeFinalizer())
-			patch := client.MergeFrom(lv)
-			if err := r.client.Patch(ctx, lv2, patch); err != nil {
-				log.Error(err, "failed to add finalizer", "name", lv.Name)
-				return ctrl.Result{}, err
-			}
-			return ctrl.Result{RequeueAfter: requeueIntervalForSimpleUpdate}, nil
-		}
-
-		if !containsKeyAndValue(lv.Labels, topolvm.CreatedbyLabelKey, topolvm.CreatedbyLabelValue) {
-			lv2 := lv.DeepCopy()
 			if lv2.Labels == nil {
 				lv2.Labels = map[string]string{}
 			}
 			lv2.Labels[topolvm.CreatedbyLabelKey] = topolvm.CreatedbyLabelValue
 			patch := client.MergeFrom(lv)
 			if err := r.client.Patch(ctx, lv2, patch); err != nil {
-				log.Error(err, "failed to add label", "name", lv.Name)
+				log.Error(err, "failed to add finalizer and label", "name", lv.Name)
 				return ctrl.Result{}, err
 			}
-			return ctrl.Result{RequeueAfter: requeueIntervalForSimpleUpdate}, nil
+			lv = lv2
 		}
 
 		if lv.Status.VolumeID == "" {
