@@ -37,6 +37,7 @@ var (
 	zapOpts              zap.Options
 	profilingBindAddress string
 	metricsBindAddress   string
+	maxConcurrentLVM     int
 )
 
 // rootCmd represents the base command when called without any subcommands
@@ -64,6 +65,7 @@ func subMain(parentCtx context.Context) error {
 	logger := log.FromContext(parentCtx)
 
 	command.SetLVMPath(lvmPath)
+	command.SetMaxConcurrentCommands(maxConcurrentLVM)
 
 	if err := loadConfFile(parentCtx, cfgFilePath); err != nil {
 		return err
@@ -205,6 +207,7 @@ func init() {
 	fs.StringVar(&lvmPath, "lvm-path", "", "lvm command path on the host OS. This is deprecated and users should use lvm-command-prefix setting instead.")
 	fs.StringVar(&profilingBindAddress, "profiling-bind-address", "", "bind address to expose pprof profiling. If empty, profiling is disabled")
 	fs.StringVar(&metricsBindAddress, "metrics-bind-address", ":8080", "bind address to expose prometheus metrics. If empty, metrics are disabled")
+	fs.IntVar(&maxConcurrentLVM, "max-concurrent-lvm-commands", command.DefaultMaxConcurrentCommands, "maximum number of lvm commands to run at once; further calls wait for one to finish. 0 means no limit")
 
 	klogFlags := flag.NewFlagSet("klog", flag.ExitOnError)
 	klog.InitFlags(klogFlags)

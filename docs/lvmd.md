@@ -8,10 +8,16 @@ LVMd is a gRPC service to manage LVM volumes.  It is composed of two services:
 
 ## Command-line Flags
 
-| Option      | Type   | Default value            | Description                                |
-| ----------- | ------ | ------------------------ | ------------------------------------------ |
-| `config`    | string | `/etc/topolvm/lvmd.yaml` | Config file path for device-class settings |
-| `container` | -      | not set                  | Set if LVMd runs in the container          |
+| Option                        | Type   | Default value            | Description                                                                                  |
+| ----------------------------- | ------ | ------------------------ | -------------------------------------------------------------------------------------------- |
+| `config`                      | string | `/etc/topolvm/lvmd.yaml` | Config file path for device-class settings                                                   |
+| `container`                   | -      | not set                  | Set if LVMd runs in the container                                                            |
+| `max-concurrent-lvm-commands` | int    | `16`                     | Maximum number of `lvm` commands run at once; further calls wait for one. `0` means no limit |
+
+A command that hangs, for example while LVM waits for udev, keeps its slot until it exits. When the
+call that started it is cancelled, only the `nsenter` wrapper is stopped: `lvm` itself runs on in
+the host and lvmd frees the slot when it exits. If as many commands hang as there are slots, later
+calls wait for a slot and fail at their deadlines instead of starting more processes.
 
 ## Config File Format
 

@@ -12,3 +12,10 @@ var SetLVMPath = internalLvmdCommand.SetLVMPath
 // For example, if it's X, `/sbin/lvm lvcreate ...` will be run as `X /sbin/lvm
 // lvcreate ...`.  This function must not be called together with SetLVMPath.
 var SetLVMCommandPrefix = internalLvmdCommand.SetLVMCommandPrefix
+
+// SetMaxConcurrentCommands bounds the number of LVM commands run at once.
+var SetMaxConcurrentCommands = internalLvmdCommand.SetMaxConcurrentCommands
+
+// DefaultMaxConcurrentCommands is the default bound on the number of LVM
+// commands run at once.
+const DefaultMaxConcurrentCommands = internalLvmdCommand.DefaultMaxConcurrentCommands

@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"slices"
 	"strings"
+	"sync"
 
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
@@ -20,9 +21,45 @@ const (
 	verbosityLVMStateNoUpdate = 4
 )
 
+// DefaultMaxConcurrentCommands is the default bound on the number of LVM
+// commands run at once.
+const DefaultMaxConcurrentCommands = 16
+
 var (
 	lvmCommandPrefix = []string{"/usr/bin/nsenter", "-m", "-u", "-i", "-n", "-p", "-t", "1", "/sbin/lvm"}
+
+	// commandSlots holds one token per LVM command that may run at once.
+	commandSlots = make(chan struct{}, DefaultMaxConcurrentCommands)
 )
+
+// SetMaxConcurrentCommands bounds the number of LVM commands run at once, so
+// that a burst of requests cannot start an unbounded number of processes that
+// all contend for the same volume group lock. Calls beyond the bound wait for
+// a running command to finish, or for their context to end. A value of zero
+// or less removes the bound. It must be called before any command is run.
+func SetMaxConcurrentCommands(n int) {
+	if n <= 0 {
+		commandSlots = nil
+		return
+	}
+	commandSlots = make(chan struct{}, n)
+}
+
+// acquireCommandSlot waits for a free command slot and returns the function
+// that frees it.
+func acquireCommandSlot(ctx context.Context) (func(), error) {
+	slots := commandSlots
+	if slots == nil {
+		return func() {}, nil
+	}
+	select {
+	case slots <- struct{}{}:
+	case <-ctx.Done():
+		return nil, fmt.Errorf("waiting to run an lvm command: %w", context.Cause(ctx))
+	}
+	var once sync.Once
+	return func() { once.Do(func() { <-slots }) }, nil
+}
 
 // SetLVMPath sets the path to the lvm command. Note that this function must not
 // be called together with SetLVMCommandPrefix.
@@ -85,7 +122,28 @@ func callLVMStreamed(ctx context.Context, logVerbosity int, args ...string) (io.
 	cmd := exec.CommandContext(ctx, wholeCommand[0], wholeCommand[1:]...)
 	cmd.Env = os.Environ()
 	cmd.Env = append(cmd.Env, "LC_ALL=C")
-	return runCommand(ctx, logVerbosity, cmd)
+
+	release, err := acquireCommandSlot(ctx)
+	if err != nil {
+		return nil, err
+	}
+	stream, err := runCommand(ctx, logVerbosity, cmd)
+	if err != nil {
+		release()
+		return nil, err
+	}
+	return releasingReadCloser{ReadCloser: stream, release: release}, nil
+}
+
+// releasingReadCloser frees the command's slot once the command is closed.
+type releasingReadCloser struct {
+	io.ReadCloser
+	release func()
+}
+
+func (r releasingReadCloser) Close() error {
+	defer r.release()
+	return r.ReadCloser.Close()
 }
 
 // runCommand runs the command and returns the stdout as a ReadCloser that also Waits for the command to finish.

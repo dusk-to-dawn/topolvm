@@ -88,6 +88,7 @@ func subMain(ctx context.Context) error {
 	var health grpc_health_v1.HealthClient
 
 	lvmd.SetLVMPath(config.lvmPath)
+	lvmd.SetMaxConcurrentCommands(config.maxConcurrentLVM)
 
 	if config.embedLvmd {
 		if err := loadConfFile(ctx, cfgFilePath); err != nil {
