@@ -8,10 +8,11 @@ LVMd is a gRPC service to manage LVM volumes.  It is composed of two services:
 
 ## Command-line Flags
 
-| Option      | Type   | Default value            | Description                                |
-| ----------- | ------ | ------------------------ | ------------------------------------------ |
-| `config`    | string | `/etc/topolvm/lvmd.yaml` | Config file path for device-class settings |
-| `container` | -      | not set                  | Set if LVMd runs in the container          |
+| Option                        | Type   | Default value            | Description                                                                                  |
+| ----------------------------- | ------ | ------------------------ | -------------------------------------------------------------------------------------------- |
+| `config`                      | string | `/etc/topolvm/lvmd.yaml` | Config file path for device-class settings                                                   |
+| `container`                   | -      | not set                  | Set if LVMd runs in the container                                                            |
+| `max-concurrent-lvm-commands` | int    | `16`                     | Maximum number of `lvm` commands run at once; further calls wait for one. `0` means no limit |
 
 ## Config File Format
 

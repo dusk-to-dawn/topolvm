@@ -1,11 +1,13 @@
 package lvmd
 
 import (
+	"context"
 	"fmt"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/topolvm/topolvm/internal/lvmd/command"
 	"github.com/topolvm/topolvm/internal/lvmd/testutils/fakelvm"
 	"github.com/topolvm/topolvm/pkg/lvmd/proto"
 	"google.golang.org/grpc/codes"
@@ -101,5 +103,45 @@ func TestConcurrentResizeAndCreateKeepCapacity(t *testing.T) {
 	}
 	if virtual > 80*fakeGiB {
 		t.Errorf("thin volumes total %d GiB, more than the 80 GiB the overprovision ratio allows", virtual/fakeGiB)
+	}
+}
+
+// TestMaxConcurrentLVMCommands checks that lvmd never runs more LVM commands
+// at once than allowed, and that a call waiting for a slot honours its
+// context.
+func TestMaxConcurrentLVMCommands(t *testing.T) {
+	ctx := testContext(t)
+	f := startFakeLVMD(t, fakelvm.Options{Delay: 100 * time.Millisecond})
+	command.SetMaxConcurrentCommands(2)
+	t.Cleanup(func() { command.SetMaxConcurrentCommands(command.DefaultMaxConcurrentCommands) })
+
+	var wg sync.WaitGroup
+	for i := range 6 {
+		wg.Go(func() {
+			_, err := f.lv.CreateLV(ctx, &proto.CreateLVRequest{
+				Name: fmt.Sprintf("m%d", i), DeviceClass: fakeThinDC, SizeBytes: int64(fakeGiB),
+			})
+			if err != nil {
+				t.Errorf("CreateLV %d: %v", i, err)
+			}
+		})
+	}
+	// While the slots are taken, a call with a short deadline gives up in time.
+	time.Sleep(20 * time.Millisecond)
+	shortCtx, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	_, err := f.vg.GetLVList(shortCtx, &proto.GetLVListRequest{DeviceClass: fakeThinDC})
+	if err == nil {
+		t.Error("GetLVList succeeded although every command slot was taken")
+	}
+	// The six creations queued before it take about 900 ms in all.
+	if elapsed := time.Since(start); elapsed > 400*time.Millisecond {
+		t.Errorf("GetLVList took %v to honour a 50ms deadline", elapsed)
+	}
+	wg.Wait()
+
+	if peak := f.lvm.MaxConcurrent(t); peak > 2 {
+		t.Errorf("%d lvm commands ran at once, want at most 2", peak)
 	}
 }
