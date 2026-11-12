@@ -114,7 +114,7 @@ func subMain(parentCtx context.Context) error {
 	if err != nil {
 		return err
 	}
-	grpcServer := grpc.NewServer()
+	grpcServer := grpc.NewServer(grpc.UnaryInterceptor(lvmd.FeaturesUnaryInterceptor))
 	dcm := lvmd.NewDeviceClassManager(config.DeviceClasses)
 	ocm := lvmd.NewLvcreateOptionClassManager(config.LvcreateOptionClasses)
 	vgService, notifier := lvmd.NewVGService(dcm)

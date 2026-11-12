@@ -15,6 +15,7 @@ import (
 	topolvmlegacyv1 "github.com/topolvm/topolvm/api/legacy/v1"
 	topolvmv1 "github.com/topolvm/topolvm/api/v1"
 	clientwrapper "github.com/topolvm/topolvm/internal/client"
+	internallvmd "github.com/topolvm/topolvm/internal/lvmd"
 	"github.com/topolvm/topolvm/internal/runners"
 	"github.com/topolvm/topolvm/pkg/controller"
 	"github.com/topolvm/topolvm/pkg/driver"
@@ -129,7 +130,11 @@ func subMain(ctx context.Context) error {
 			return err
 		}
 		defer func() { _ = conn.Close() }()
-		lvService, vgService = proto.NewLVServiceClient(conn), proto.NewVGServiceClient(conn)
+		// lvmd runs as its own DaemonSet and may be older than this
+		// topolvm-node, so concurrent capacity changes wait until it is
+		// known to reserve capacity.
+		lvService = internallvmd.NewCapacityGuardedLVServiceClient(proto.NewLVServiceClient(conn))
+		vgService = proto.NewVGServiceClient(conn)
 		health = grpc_health_v1.NewHealthClient(conn)
 	}
 
