@@ -132,8 +132,9 @@ func subMain(ctx context.Context) error {
 		defer func() { _ = conn.Close() }()
 		// lvmd runs as its own DaemonSet and may be older than this
 		// topolvm-node, so concurrent capacity changes wait until it is
-		// known to reserve capacity.
-		lvService = internallvmd.NewCapacityGuardedLVServiceClient(proto.NewLVServiceClient(conn))
+		// known to reserve capacity. The guarded client keeps connections
+		// of its own, each tied to one lvmd process.
+		lvService = internallvmd.NewCapacityGuardedLVServiceClient(ctx, config.lvmdSocket)
 		vgService = proto.NewVGServiceClient(conn)
 		health = grpc_health_v1.NewHealthClient(conn)
 	}
