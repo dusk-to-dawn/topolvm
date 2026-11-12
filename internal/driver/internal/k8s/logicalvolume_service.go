@@ -270,9 +270,7 @@ func (s *LogicalVolumeService) CreateVolume(ctx context.Context, node, dc, oc, n
 	// if the create volume request has no source, proceed with regular lv creation.
 	if sourceName == "" {
 		lv = &topolvmv1.LogicalVolume{
-			ObjectMeta: metav1.ObjectMeta{
-				Name: name,
-			},
+			ObjectMeta: newLogicalVolumeMeta(name),
 			Spec: topolvmv1.LogicalVolumeSpec{
 				Name:                name,
 				NodeName:            node,
@@ -285,9 +283,7 @@ func (s *LogicalVolumeService) CreateVolume(ctx context.Context, node, dc, oc, n
 	} else {
 		// On the other hand, if a volume has a datasource, create a thin snapshot of the source volume with READ-WRITE access for volume cloning.
 		lv = &topolvmv1.LogicalVolume{
-			ObjectMeta: metav1.ObjectMeta{
-				Name: name,
-			},
+			ObjectMeta: newLogicalVolumeMeta(name),
 			Spec: topolvmv1.LogicalVolumeSpec{
 				Name:                name,
 				NodeName:            node,
@@ -301,6 +297,18 @@ func (s *LogicalVolumeService) CreateVolume(ctx context.Context, node, dc, oc, n
 	}
 
 	return s.createAndWait(ctx, lv)
+}
+
+// newLogicalVolumeMeta returns the metadata of a new LogicalVolume. It
+// carries the finalizer and label that topolvm-node would otherwise add with
+// a patch before creating the volume, so that topolvm-node can create it on
+// its first pass. topolvm-node still adds them if they are missing.
+func newLogicalVolumeMeta(name string) metav1.ObjectMeta {
+	return metav1.ObjectMeta{
+		Name:       name,
+		Finalizers: []string{topolvm.GetLogicalVolumeFinalizer()},
+		Labels:     map[string]string{topolvm.CreatedbyLabelKey: topolvm.CreatedbyLabelValue},
+	}
 }
 
 // DeleteVolume deletes volume
@@ -344,9 +352,7 @@ func (s *LogicalVolumeService) DeleteVolume(ctx context.Context, volumeID string
 func (s *LogicalVolumeService) CreateSnapshot(ctx context.Context, node, dc, sourceVol, sname, accessType string, snapSize resource.Quantity) (*topolvmv1.LogicalVolume, error) {
 	logger.Info("CreateSnapshot called", "name", sname)
 	snapshotLV := &topolvmv1.LogicalVolume{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: sname,
-		},
+		ObjectMeta: newLogicalVolumeMeta(sname),
 		Spec: topolvmv1.LogicalVolumeSpec{
 			Name:        sname,
 			NodeName:    node,
