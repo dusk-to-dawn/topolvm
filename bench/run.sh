@@ -12,13 +12,15 @@
 #   LVMD_ARGS    space-separated extra lvmd arguments
 #   PROVISIONER_ARGS space-separated extra csi-provisioner arguments
 #                (needs a chart with controller.csiProvisioner.args)
-#   SIZES        volume counts per round, e.g. "12 40"
+#   SIZES        volume counts per round, e.g. "1 12 40"
+#   MODES        "pods", "pvc" or both (see the round loop)
 #   REPEATS      rounds per size
 #   OUT          output directory
 set -euo pipefail
 
 : "${SRC:?}" "${CHART:?}" "${IMAGE_MODE:?}" "${OUT:?}"
-SIZES=${SIZES:-"12 40"}
+SIZES=${SIZES:-"1 12 40"}
+MODES=${MODES:-"pods pvc"}
 REPEATS=${REPEATS:-2}
 NODE_ARGS=${NODE_ARGS:-}
 LVMD_ARGS=${LVMD_ARGS:-}
@@ -154,11 +156,29 @@ done
 } > "$OUT/env.txt"
 cat "$OUT/env.txt" >&2
 
-pods_manifest() { # round count
-  local round=$1 count=$2 i
-  for i in $(seq -w 1 "$count"); do
+object_manifest() { # mode round index
+  local mode=$1 round=$2 i=$3
+  if [ "$mode" = pvc ]; then
     cat <<EOF
----
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: $round-$i
+  namespace: $NS
+  labels:
+    bench: "$round"
+  annotations:
+    volume.kubernetes.io/selected-node: $NODE
+spec:
+  accessModes: ["ReadWriteOnce"]
+  volumeMode: Block
+  storageClassName: bench-thin
+  resources:
+    requests:
+      storage: 1Gi
+EOF
+  else
+    cat <<EOF
 apiVersion: v1
 kind: Pod
 metadata:
@@ -189,53 +209,67 @@ spec:
               requests:
                 storage: 1Gi
 EOF
-  done
+  fi
 }
 
 lv_count() { "$KUBECTL" get logicalvolumes.topolvm.io --no-headers 2>/dev/null | wc -l; }
 
-for size in $SIZES; do
-  for rep in $(seq "$REPEATS"); do
-    round="n$size-r$rep"
-    rdir="$OUT/$round"
-    mkdir -p "$rdir"
-    pods_manifest "$round" "$size" > "$rdir/pods.yaml"
-    sleep 5
-    log "round $round: create $size pods"
-    t0=$(date -u +%s.%N)
-    "$KUBECTL" create -f "$rdir/pods.yaml" >/dev/null
-    t_created=$(date -u +%s.%N)
-    deadline=$(( $(date +%s) + 300 ))
-    while :; do
-      bound=$("$KUBECTL" get pvc -n "$NS" -o jsonpath='{range .items[*]}{.metadata.name} {.status.phase}{"\n"}{end}' \
-        | awk -v r="$round-" 'index($1, r) == 1 && $2 == "Bound"' | wc -l)
-      [ "$bound" -ge "$size" ] && break
-      if [ "$(date +%s)" -gt "$deadline" ]; then log "round $round: timeout with $bound bound"; break; fi
-      sleep 0.5
-    done
-    t_bound=$(date -u +%s.%N)
-    sleep 3
-    since=$(date -u -d "@${t0%.*}" +%Y-%m-%dT%H:%M:%SZ)
-    "$KUBECTL" logs -n topolvm-system deploy/topolvm-controller -c csi-provisioner --timestamps --since-time="$since" > "$rdir/provisioner.log"
-    "$KUBECTL" logs -n topolvm-system deploy/topolvm-controller -c topolvm-controller --timestamps --since-time="$since" > "$rdir/controller.log"
-    "$KUBECTL" logs -n topolvm-system "$NODE_POD" -c topolvm-node --timestamps --since-time="$since" > "$rdir/node.log"
-    sudo journalctl -u lvmd1.service -o cat --since "@${t0%.*}" > "$rdir/lvmd.log"
-    "$KUBECTL" get pvc -n "$NS" -o json > "$rdir/pvc.json"
-    log "round $round: delete"
-    t_del=$(date -u +%s.%N)
-    "$KUBECTL" delete pod -n "$NS" -l "bench=$round" --wait=false >/dev/null
-    deadline=$(( $(date +%s) + 300 ))
-    while [ "$(lv_count)" -gt 0 ]; do
-      if [ "$(date +%s)" -gt "$deadline" ]; then log "round $round: deletion timeout"; break; fi
-      sleep 0.5
-    done
-    t_deleted=$(date -u +%s.%N)
-    sleep 3
-    sudo journalctl -u lvmd1.service -o cat --since "@${t_del%.*}" > "$rdir/lvmd-delete.log"
-    cat > "$rdir/times.json" <<EOF
-{"round": "$round", "size": $size, "t0": $t0, "t_created": $t_created, "t_bound": $t_bound, "t_del": $t_del, "t_deleted": $t_deleted}
+# Modes: "pods" creates Pods with a generic ephemeral block volume each, pinned
+# to one node (the claims pass through the ephemeral volume controller and the
+# scheduler); "pvc" creates claims that already carry the selected-node
+# annotation the scheduler would set, so provisioning starts at once and no
+# Pod, kubelet or NodePublishVolume call is involved.
+for mode in $MODES; do
+  for size in $SIZES; do
+    for rep in $(seq "$REPEATS"); do
+      round="$mode-n$size-r$rep"
+      rdir="$OUT/$round"
+      mkdir -p "$rdir/objects"
+      for i in $(seq -w 1 "$size"); do
+        object_manifest "$mode" "$round" "$i" > "$rdir/objects/$i.yaml"
+      done
+      sleep 5
+      log "round $round: create $size objects"
+      t0=$(date -u +%s.%N)
+      # One kubectl per object, all started together.
+      find "$rdir/objects" -name '*.yaml' | sort \
+        | xargs -P 64 -n 1 "$KUBECTL" create -f >/dev/null
+      t_created=$(date -u +%s.%N)
+      deadline=$(( $(date +%s) + 300 ))
+      while :; do
+        bound=$("$KUBECTL" get pvc -n "$NS" -o jsonpath='{range .items[*]}{.metadata.name} {.status.phase}{"\n"}{end}' \
+          | awk -v r="$round-" 'index($1, r) == 1 && $2 == "Bound"' | wc -l)
+        [ "$bound" -ge "$size" ] && break
+        if [ "$(date +%s)" -gt "$deadline" ]; then log "round $round: timeout with $bound bound"; break; fi
+        sleep 0.5
+      done
+      t_bound=$(date -u +%s.%N)
+      sleep 3
+      since=$(date -u -d "@${t0%.*}" +%Y-%m-%dT%H:%M:%SZ)
+      "$KUBECTL" logs -n topolvm-system deploy/topolvm-controller -c csi-provisioner --timestamps --since-time="$since" > "$rdir/provisioner.log"
+      "$KUBECTL" logs -n topolvm-system deploy/topolvm-controller -c topolvm-controller --timestamps --since-time="$since" > "$rdir/controller.log"
+      "$KUBECTL" logs -n topolvm-system "$NODE_POD" -c topolvm-node --timestamps --since-time="$since" > "$rdir/node.log"
+      sudo journalctl -u lvmd1.service -o cat --since "@${t0%.*}" > "$rdir/lvmd.log"
+      log "round $round: delete"
+      t_del=$(date -u +%s.%N)
+      if [ "$mode" = pvc ]; then
+        "$KUBECTL" delete pvc -n "$NS" -l "bench=$round" --wait=false >/dev/null
+      else
+        "$KUBECTL" delete pod -n "$NS" -l "bench=$round" --wait=false >/dev/null
+      fi
+      deadline=$(( $(date +%s) + 300 ))
+      while [ "$(lv_count)" -gt 0 ]; do
+        if [ "$(date +%s)" -gt "$deadline" ]; then log "round $round: deletion timeout"; break; fi
+        sleep 0.5
+      done
+      t_deleted=$(date -u +%s.%N)
+      sleep 3
+      sudo journalctl -u lvmd1.service -o cat --since "@${t_del%.*}" > "$rdir/lvmd-delete.log"
+      cat > "$rdir/times.json" <<EOF
+{"round": "$round", "mode": "$mode", "size": $size, "t0": $t0, "t_created": $t_created, "t_bound": $t_bound, "t_del": $t_del, "t_deleted": $t_deleted}
 EOF
-    python3 "$HERE/parse.py" "$rdir" | tee "$rdir/result.json" >&2
+      python3 "$HERE/parse.py" "$rdir" | tee "$rdir/result.json" >&2
+    done
   done
 done
 

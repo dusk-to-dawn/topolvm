@@ -84,7 +84,13 @@ def main(rdir):
     lvmd_created = [t for t in lvmd_times(rdir / "lvmd.log", "created a new LV") if t >= t0]
 
     last_node = max(node_created) if node_created else None
-    window_end = (last_node or times["t_bound"]) + 2.0
+    # Commands are counted up to shortly after lvmd reports the last creation.
+    # In "pods" rounds this window also holds the reports that
+    # NodePublishVolume and NodeGetVolumeStats run for volumes created earlier
+    # in the round; "pvc" rounds have no such calls.
+    last_lvmd = max(lvmd_created) if lvmd_created else None
+    window_end = (last_lvmd or last_node or times["t_bound"]) + 0.5
+    durations = sorted(succeeded[c] - starts[c] for c in succeeded if c in starts)
     create_cmds = lvmd_commands(rdir / "lvmd.log", t0, window_end)
     delete_cmds = lvmd_commands(rdir / "lvmd-delete.log", times["t_del"], times["t_deleted"] + 2.0)
     removed = [t for t in lvmd_times(rdir / "lvmd-delete.log", "removed a LV") if t >= times["t_del"]]
@@ -98,6 +104,7 @@ def main(rdir):
 
     result = {
         "round": round_name,
+        "mode": times.get("mode"),
         "volumes": size,
         "succeeded": len(succeeded),
         "provisioning_failed": failed,
@@ -107,6 +114,9 @@ def main(rdir):
         "last_node_created_s": rel(last_node),
         "last_lvmd_created_s": rel(max(lvmd_created)) if lvmd_created else None,
         "last_succeeded_s": rel(max(succeeded.values())) if succeeded else None,
+        "claim_start_to_succeeded_s_min": round(durations[0], 3) if durations else None,
+        "claim_start_to_succeeded_s_median": round(durations[len(durations) // 2], 3) if durations else None,
+        "claim_start_to_succeeded_s_max": round(durations[-1], 3) if durations else None,
         "all_bound_seen_s": rel(times["t_bound"]),
         "lvm_commands_create_window": create_cmds,
         "lvm_per_volume_excl_fullreport": per_volume(create_cmds, len(lvmd_created), False),

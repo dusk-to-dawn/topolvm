@@ -20,7 +20,7 @@ on:
       sizes:
         description: "Volume counts per round"
         required: false
-        default: "12 40"
+        default: "1 12 40"
         type: string
       repeats:
         description: "Rounds per size"
@@ -114,7 +114,7 @@ jobs:
           NODE_ARGS: ${{ matrix.node_args }}
           LVMD_ARGS: ${{ matrix.lvmd_args }}
           PROVISIONER_ARGS: ${{ matrix.provisioner_args }}
-          SIZES: ${{ inputs.sizes || '12 40' }}
+          SIZES: ${{ inputs.sizes || '1 12 40' }}
           REPEATS: ${{ inputs.repeats || '2' }}
         run: ./harness/bench/run.sh
       - name: Summary

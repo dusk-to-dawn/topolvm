@@ -12,6 +12,8 @@ COLUMNS = [
     ("last_provisioning_start_s", "last start s"),
     ("last_node_created_s", "last node-side create s"),
     ("last_succeeded_s", "last ProvisioningSucceeded s"),
+    ("claim_start_to_succeeded_s_median", "claim median s"),
+    ("claim_start_to_succeeded_s_max", "claim max s"),
     ("lvm_per_volume_excl_fullreport", "lvm per create"),
     ("fullreports_create_window", "fullreports"),
     ("delete_all_lvs_gone_s", "all LVs gone s"),
