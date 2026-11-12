@@ -68,7 +68,7 @@ jobs:
     needs: plan
     name: "${{ matrix.name }}"
     runs-on: "ubuntu-22.04"
-    timeout-minutes: 40
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
@@ -87,6 +87,18 @@ jobs:
           persist-credentials: false
           ref: ${{ matrix.chart_ref }}
           path: chart
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: ${{ matrix.baseline }}
+        with:
+          persist-credentials: false
+          ref: "base-v0.42.1"
+          path: base-src
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: ${{ matrix.baseline }}
+        with:
+          persist-credentials: false
+          ref: "base-chart-v17.3.1"
+          path: base-chart
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: "src/go.mod"
@@ -103,6 +115,19 @@ jobs:
             echo "- lvmd args: \`${{ matrix.lvmd_args }}\`"
             echo "- csi-provisioner args: \`${{ matrix.provisioner_args }}\`"
           } >> "$GITHUB_STEP_SUMMARY"
+      # The same rounds with upstream's released image and chart on this very
+      # runner, so that the two can be compared on one machine.
+      - name: Run baseline rounds (upstream 0.42.1)
+        if: ${{ matrix.baseline }}
+        env:
+          SRC: ${{ github.workspace }}/base-src
+          CHART: ${{ github.workspace }}/base-chart
+          OUT: ${{ github.workspace }}/out/${{ matrix.name }}-baseline
+          IMAGE_MODE: "pull"
+          IMAGE: "ghcr.io/topolvm/topolvm-with-sidecar:0.42.1"
+          SIZES: ${{ inputs.sizes || '1 12 40' }}
+          REPEATS: ${{ inputs.repeats || '2' }}
+        run: ./harness/bench/run.sh
       - name: Run rounds
         env:
           SRC: ${{ github.workspace }}/src
@@ -122,7 +147,11 @@ jobs:
         env:
           OUT: ${{ github.workspace }}/out/${{ matrix.name }}
           NAME: ${{ matrix.name }}
-        run: python3 harness/bench/summary.py "$NAME" "$OUT" >> "$GITHUB_STEP_SUMMARY" || true
+        run: |
+          if [ -d "$OUT-baseline" ]; then
+            python3 harness/bench/summary.py "$NAME-baseline" "$OUT-baseline" >> "$GITHUB_STEP_SUMMARY" || true
+          fi
+          python3 harness/bench/summary.py "$NAME" "$OUT" >> "$GITHUB_STEP_SUMMARY" || true
       - name: Upload results
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

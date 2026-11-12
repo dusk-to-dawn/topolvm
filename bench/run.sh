@@ -37,6 +37,7 @@ NODE=topolvm-e2e-worker
 NS=bench
 PAUSE_IMAGE=registry.k8s.io/pause:3.10
 mkdir -p "$WORK" "$OUT"
+T_START=$(date +%s)
 
 log() { printf '%s %s\n' "$(date -u +%H:%M:%S.%3N)" "$*" >&2; }
 
@@ -63,6 +64,7 @@ device-classes:
       name: "pool0"
       overprovision-ratio: 10.0
 EOF
+  sudo systemctl reset-failed "lvmd$i.service" 2>/dev/null || true
   # shellcheck disable=SC2086
   sudo systemd-run --unit="lvmd$i.service" "$WORK/lvmd" --config="$WORK/lvmd$i.yaml" \
     --zap-log-level=4 --zap-time-encoding=rfc3339nano $LVMD_ARGS
@@ -273,5 +275,18 @@ EOF
   done
 done
 
-sudo journalctl -u lvmd1.service -o cat > "$OUT/lvmd1-full.log" || true
+sudo journalctl -u lvmd1.service -o cat --since "@${T_START}" > "$OUT/lvmd1-full.log" || true
 "$KUBECTL" logs -n topolvm-system "$NODE_POD" -c topolvm-node --timestamps > "$OUT/node-full.log" || true
+
+# Leave the runner as it was found, so that another configuration can run in
+# the same job.
+log "teardown"
+make -C "$E2E" shutdown-kind >/dev/null 2>&1 || true
+for i in 1 2 3; do
+  sudo systemctl stop "lvmd$i.service" || true
+  sudo vgremove -ffy "node$i-bench" >/dev/null
+  dev=$(sudo losetup -j "$WORK/backing$i" | cut -d: -f1)
+  sudo pvremove -ffy "$dev" >/dev/null
+  sudo losetup -d "$dev"
+  rm -f "$WORK/backing$i"
+done
