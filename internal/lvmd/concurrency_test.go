@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -217,5 +218,53 @@ func TestMaxConcurrentLVMCommands(t *testing.T) {
 
 	if peak := f.lvm.MaxConcurrent(t); peak > 2 {
 		t.Errorf("%d lvm commands ran at once, want at most 2", peak)
+	}
+}
+
+// TestWatchCoalescesReports checks that a burst of changes produces at most
+// one full report per interval for a watcher, never two at once.
+func TestWatchCoalescesReports(t *testing.T) {
+	ctx, cancel := context.WithCancel(testContext(t))
+	defer cancel()
+	f := startFakeLVMD(t, fakelvm.Options{Delay: 20 * time.Millisecond})
+	interval := watchMinInterval
+	watchMinInterval = 200 * time.Millisecond
+	t.Cleanup(func() { watchMinInterval = interval })
+
+	ch := make(chan struct{})
+	var sent atomic.Int32
+	go func() {
+		for range ch {
+			sent.Add(1)
+		}
+	}()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = f.vg.Watch(&proto.Empty{}, &mockWatchServer{ctx: ctx, ch: ch})
+	}()
+
+	// One change every 10 ms for 600 ms, as many concurrent creations would cause.
+	for range 60 {
+		f.lv.(*lvService).notify()
+		time.Sleep(10 * time.Millisecond)
+	}
+	time.Sleep(2 * watchMinInterval)
+	cancel()
+	<-done
+	close(ch)
+
+	reports := 0
+	for _, name := range f.lvm.SubCommands(t) {
+		if name == "fullreport" {
+			reports++
+		}
+	}
+	// The initial report, then at most one per 200 ms over about 1 s.
+	if reports < 2 || reports > 7 {
+		t.Errorf("%d full reports for 60 changes, want between 2 and 7", reports)
+	}
+	if peak := f.lvm.MaxConcurrent(t, "fullreport"); peak != 1 {
+		t.Errorf("%d full reports ran at once, want 1", peak)
 	}
 }
