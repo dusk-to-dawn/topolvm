@@ -85,3 +85,14 @@ jobs:
     with:
       test_scheduler_extender_type: "none"
       test_legacy: false
+
+  concurrent-reconciles:
+    needs: build
+    uses: $/.github/workflows/e2e-k8s-workflow.yaml
+    permissions:
+      contents: read
+      id-token: write
+    with:
+      test_scheduler_extender_type: "daemonset"
+      test_legacy: false
+      test_concurrent_reconciles: true

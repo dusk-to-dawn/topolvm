@@ -1,0 +1,3 @@
+node:
+  args:
+    - --max-concurrent-reconciles=8

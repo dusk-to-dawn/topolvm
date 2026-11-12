@@ -7,6 +7,8 @@ TEST_SCHEDULER_EXTENDER_TYPE ?= deployment
 TEST_LEGACY ?= false
 # systemd-service/daemonset/embedded
 TEST_LVMD_TYPE ?= systemd-service
+# true/false: run topolvm-node with eight reconcile workers
+TEST_CONCURRENT_RECONCILES ?= false
 
 BACKING_STORE := ./build
 BINDIR := $(shell pwd)/bin
@@ -52,6 +54,10 @@ ifeq ($(TEST_LVMD_TYPE),systemd-service)
 HELM_VALUES_FILES += manifests/values/systemd-service-lvmd.yaml
 else ifeq ($(TEST_LVMD_TYPE),embedded)
 HELM_VALUES_FILES += manifests/values/embedded-lvmd.yaml
+endif
+
+ifeq ($(TEST_CONCURRENT_RECONCILES),true)
+HELM_VALUES_FILES += manifests/values/concurrent-reconciles.yaml
 endif
 
 ifeq ($(STORAGE_CAPACITY),true)
