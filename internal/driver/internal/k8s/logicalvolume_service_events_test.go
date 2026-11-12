@@ -143,6 +143,12 @@ func TestLogicalVolumeServiceWaits(t *testing.T) {
 			done <- result{time.Now(), err}
 		}()
 		lv := e.waitForLV(t, "create-ok")
+		if !controllerutil.ContainsFinalizer(lv, topolvm.GetLogicalVolumeFinalizer()) {
+			t.Error("LogicalVolume was created without its finalizer")
+		}
+		if lv.Labels[topolvm.CreatedbyLabelKey] != topolvm.CreatedbyLabelValue {
+			t.Error("LogicalVolume was created without its label")
+		}
 
 		// Finish between two of the old polls (at 1 s and 3 s).
 		time.Sleep(1500 * time.Millisecond)
