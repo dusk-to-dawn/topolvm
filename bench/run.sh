@@ -227,15 +227,23 @@ for mode in $MODES; do
       round="$mode-n$size-r$rep"
       rdir="$OUT/$round"
       mkdir -p "$rdir/objects"
+      # Four kubectl processes, each creating a quarter of the objects: more
+      # processes than CPUs make the requests arrive later, not sooner.
+      n=0
       for i in $(seq -w 1 "$size"); do
-        object_manifest "$mode" "$round" "$i" > "$rdir/objects/$i.yaml"
+        { echo "---"; object_manifest "$mode" "$round" "$i"; } >> "$rdir/objects/chunk$((n % 4)).yaml"
+        n=$((n + 1))
       done
       sleep 5
       log "round $round: create $size objects"
       t0=$(date -u +%s.%N)
-      # One kubectl per object, all started together.
-      find "$rdir/objects" -name '*.yaml' | sort \
-        | xargs -P 64 -n 1 "$KUBECTL" create -f >/dev/null
+      pids=""
+      for f in "$rdir"/objects/chunk*.yaml; do
+        "$KUBECTL" create -f "$f" >/dev/null &
+        pids="$pids $!"
+      done
+      # shellcheck disable=SC2086
+      wait $pids
       t_created=$(date -u +%s.%N)
       deadline=$(( $(date +%s) + 300 ))
       while :; do
