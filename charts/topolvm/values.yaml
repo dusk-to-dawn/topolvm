@@ -8,10 +8,10 @@ crd:
 
 image:
   # image.repository -- TopoLVM image repository to use.
-  repository: ghcr.io/topolvm/topolvm-with-sidecar
+  repository: ghcr.io/dusk-to-dawn/topolvm-with-sidecar
 
   # image.reference -- TopoLVM image reference (a tag and/or a digest, e.g. "0.41.0@sha256:...") to use.
-  reference: 0.42.1@sha256:00acceab51f358ea88abd74bd0968f78764e9aa94146590e9bc5ead30243c45a
+  reference: 0.42.1-fast.1
 
   # image.pullPolicy -- TopoLVM image pullPolicy.
   pullPolicy:  # Always

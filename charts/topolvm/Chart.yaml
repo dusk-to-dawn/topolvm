@@ -3,11 +3,12 @@ type: application
 
 home: https://github.com/topolvm/topolvm
 name: topolvm
-description: Topolvm
-version: 17.3.1
-appVersion: 0.42.1
+description: TopoLVM, a fork build with faster volume provisioning (not an upstream release)
+version: 17.3.1-fast.1
+appVersion: 0.42.1-fast.1
 sources:
   - https://github.com/topolvm/topolvm
+  - https://github.com/dusk-to-dawn/topolvm
 
 dependencies:
   - name: cert-manager
@@ -18,7 +19,4 @@ dependencies:
 annotations:
   artifacthub.io/images: |
     - name: topolvm-with-sidecar
-      image: ghcr.io/topolvm/topolvm-with-sidecar:0.42.1
-    - name: topolvm-with
-      image: ghcr.io/topolvm/topolvm:0.42.1
-  artifacthub.io/license: Apache-2.0
+      image: ghcr.io/dusk-to-dawn/topolvm-with-sidecar:0.42.1-fast.1

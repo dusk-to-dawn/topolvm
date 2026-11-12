@@ -1,5 +1,12 @@
 # TopoLVM Helm Chart
 
+> This chart is published from a fork of TopoLVM and is not an upstream release.
+> It is the upstream chart 17.3.1 with two changes: arguments can be passed to the
+> CSI sidecars (`controller.csiProvisioner.args`, `controller.csiResizer.args`,
+> `controller.csiSnapshotter.args` and `node.csiRegistrar.args`, backported from
+> upstream's main branch), and the default image is a build of TopoLVM 0.42.1 with
+> faster volume provisioning.
+
 ## Prerequisites
 
 * `cert-manager` version `v1.7.0+` installed. ref: https://cert-manager.io/
@@ -7,7 +14,7 @@
 
 ## Installation
 
-See [Getting Started](https://github.com/topolvm/topolvm/blob/topolvm-chart-v{{ template "chart.version" . }}/docs/getting-started.md).
+See [Getting Started](https://github.com/topolvm/topolvm/blob/topolvm-chart-v17.3.1/docs/getting-started.md).
 
 {{ template "chart.valuesSection" . }}
 
