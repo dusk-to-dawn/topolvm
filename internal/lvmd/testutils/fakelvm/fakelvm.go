@@ -40,6 +40,9 @@ const (
 	envWriteDelay = "TOPOLVM_FAKE_LVM_WRITE_DELAY"
 	// envFail names a sub-command that fails without changing anything.
 	envFail = "TOPOLVM_FAKE_LVM_FAIL"
+	// envPause names a sub-command whose first run waits, before it does
+	// anything, until the test resumes it.
+	envPause = "TOPOLVM_FAKE_LVM_PAUSE"
 
 	// keyReport is the top-level key of LVM's JSON reports.
 	keyReport = "report"
@@ -128,6 +131,11 @@ type Options struct {
 	LockedDelay time.Duration
 	// WriteDelay, if set, replaces Delay for modifying commands.
 	WriteDelay time.Duration
+	// LikeNsenter runs each command behind a shell that forks it, as lvmd's
+	// default nsenter prefix does: cancelling a call then stops only the
+	// shell, while the command itself runs to completion and lvmd waits
+	// for its output to end.
+	LikeNsenter bool
 }
 
 // Start writes the initial state, makes lvm commands started by this test
@@ -158,7 +166,11 @@ func Start(t testing.TB, initial State, opts Options, getPrefix func() []string,
 	t.Setenv(envWriteDelay, opts.WriteDelay.String())
 
 	prev := getPrefix()
-	setPrefix([]string{bin})
+	if opts.LikeNsenter {
+		setPrefix([]string{"/bin/sh", "-c", `"$0" "$@" & wait $!`, bin})
+	} else {
+		setPrefix([]string{bin})
+	}
 	t.Cleanup(func() { setPrefix(prev) })
 	return f
 }
@@ -200,6 +212,56 @@ func (f *Fake) Invocations(t testing.TB) []Invocation {
 func (f *Fake) Fail(t testing.TB, subCommand string) {
 	t.Helper()
 	t.Setenv(envFail, subCommand)
+}
+
+// Pause makes the first later run of the named sub-command wait, before it
+// does anything, until Resume is called.
+func (f *Fake) Pause(t testing.TB, subCommand string) {
+	t.Helper()
+	t.Setenv(envPause, subCommand)
+}
+
+// WaitPaused waits until a run of the sub-command given to Pause is waiting.
+func (f *Fake) WaitPaused(t testing.TB) {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		if _, err := os.Stat(f.statePath + ".paused"); err == nil {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the paused command did not start")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// Resume lets the paused command go on.
+func (f *Fake) Resume(t testing.TB) {
+	t.Helper()
+	if err := os.WriteFile(f.statePath+".resume", nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// pauseIfAsked waits for the test to resume a command it asked to pause. Only
+// the first run of that sub-command pauses.
+func pauseIfAsked(statePath, cmd string) {
+	if os.Getenv(envPause) != cmd {
+		return
+	}
+	marker, err := os.OpenFile(statePath+".paused", os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return // paused once already
+	}
+	_ = marker.Close()
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(statePath + ".resume"); err == nil {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 }
 
 // Commands returns the lvm commands run so far, one entry per process,
@@ -302,6 +364,7 @@ func Main(args []string) int {
 		sleepEnv(envDelay)
 	}
 	statePath := os.Getenv(envState)
+	pauseIfAsked(statePath, cmd)
 	unlock, err := lock(statePath+".lock", how)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)

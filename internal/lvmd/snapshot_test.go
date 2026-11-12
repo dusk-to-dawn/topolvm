@@ -1,6 +1,7 @@
 package lvmd
 
 import (
+	"context"
 	"sync"
 	"testing"
 	"time"
@@ -144,5 +145,90 @@ func TestConcurrentSnapshotsAndClones(t *testing.T) {
 	}
 	if virtual > 80*fakeGiB {
 		t.Errorf("thin volumes total %d GiB, more than the 80 GiB the overprovision ratio allows", virtual/fakeGiB)
+	}
+}
+
+// TestCreateLVSnapshotCleansUpAfterCancellation cancels a clone while each of
+// its LVM steps runs. As with lvmd's nsenter prefix, cancelling stops only
+// the wrapper: the lvm command itself completes. No LV may be left behind,
+// and a retry must succeed.
+func TestCreateLVSnapshotCleansUpAfterCancellation(t *testing.T) {
+	for _, step := range []string{"lvcreate", "lvs", "lvresize", "lvchange"} {
+		t.Run("cancelled during "+step, func(t *testing.T) {
+			f := startFakeLVMD(t, fakelvm.Options{LikeNsenter: true})
+			// A clone larger than its source runs all four steps.
+			req := &proto.CreateLVSnapshotRequest{
+				Name: "clone", DeviceClass: fakeThinDC, SourceVolume: "existing-thin",
+				SizeBytes: int64(20 * fakeGiB), AccessType: "rw",
+			}
+
+			f.lvm.Pause(t, step)
+			ctx, cancel := context.WithCancel(testContext(t))
+			done := make(chan error, 1)
+			go func() {
+				_, err := f.lv.CreateLVSnapshot(ctx, req)
+				done <- err
+			}()
+			f.lvm.WaitPaused(t)
+			cancel()
+			f.lvm.Resume(t)
+			if err := <-done; err == nil {
+				t.Fatal("the cancelled call succeeded")
+			}
+			if lv, ok := fakeLVNames(t, f)["clone"]; ok {
+				t.Fatalf("the incomplete clone was left behind: %+v", lv)
+			}
+
+			f.lvm.Pause(t, "")
+			res, err := f.lv.CreateLVSnapshot(testContext(t), req)
+			if err != nil {
+				t.Fatalf("retry failed: %v", err)
+			}
+			if res.GetSnapshot().GetSizeBytes() != int64(20*fakeGiB) {
+				t.Errorf("retry made a clone of %d bytes", res.GetSnapshot().GetSizeBytes())
+			}
+		})
+	}
+}
+
+// TestCreateLVSnapshotOfGrowingSource grows the source between the report and
+// lvcreate -s. The snapshot then comes out larger than requested and cannot
+// be shrunk: it must be removed, and a retry with the new size must succeed.
+func TestCreateLVSnapshotOfGrowingSource(t *testing.T) {
+	ctx := testContext(t)
+	f := startFakeLVMD(t, fakelvm.Options{})
+	req := &proto.CreateLVSnapshotRequest{
+		Name: "snap", DeviceClass: fakeThinDC, SourceVolume: "existing-thin",
+		SizeBytes: int64(10 * fakeGiB), AccessType: "ro",
+	}
+
+	f.lvm.Pause(t, "lvcreate")
+	done := make(chan error, 1)
+	go func() {
+		_, err := f.lv.CreateLVSnapshot(ctx, req)
+		done <- err
+	}()
+	f.lvm.WaitPaused(t)
+	if _, err := f.lv.ResizeLV(ctx, &proto.ResizeLVRequest{
+		Name: "existing-thin", DeviceClass: fakeThinDC, SizeBytes: int64(15 * fakeGiB),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	f.lvm.Resume(t)
+	if err := <-done; status.Code(err) != codes.Internal {
+		t.Fatalf("got %v, want an Internal error for a snapshot larger than requested", err)
+	}
+	if lv, ok := fakeLVNames(t, f)["snap"]; ok {
+		t.Fatalf("the oversized snapshot was left behind: %+v", lv)
+	}
+
+	f.lvm.Pause(t, "")
+	req.SizeBytes = int64(15 * fakeGiB)
+	res, err := f.lv.CreateLVSnapshot(ctx, req)
+	if err != nil {
+		t.Fatalf("retry failed: %v", err)
+	}
+	if res.GetSnapshot().GetSizeBytes() != int64(15*fakeGiB) {
+		t.Errorf("retry made a snapshot of %d bytes, want 15 GiB", res.GetSnapshot().GetSizeBytes())
 	}
 }

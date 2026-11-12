@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/topolvm/topolvm/internal/lvmd/command"
 	"github.com/topolvm/topolvm/pkg/lvmd/proto"
@@ -12,6 +13,10 @@ import (
 	"google.golang.org/grpc/status"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
+
+// snapshotCleanupTimeout bounds the removal of an incomplete snapshot, which
+// runs even when the call that created it has been cancelled.
+var snapshotCleanupTimeout = 2 * time.Minute
 
 // NewLVService creates a new LVServiceServer
 func NewLVService(dcmapper *DeviceClassManager, ocmapper *LvcreateOptionClassManager, notifyFunc func()) proto.LVServiceServer {
@@ -256,23 +261,36 @@ func (s *lvService) CreateLVSnapshot(ctx context.Context, req *proto.CreateLVSna
 	)
 	// Create snapshot lv
 
-	if err := sourceLV.ThinSnapshot(ctx, req.GetName(), req.GetTags()); err != nil {
-		logger.Error(err, "failed to create snapshot volume")
-		return nil, status.Error(codes.Internal, err.Error())
+	// A volume of this name that existed before this call is not ours to
+	// remove: report it, as CreateLV does.
+	if _, err := vg.FindVolume(ctx, req.GetName()); err == nil {
+		return nil, status.Errorf(codes.AlreadyExists, "logical volume %s already exists", req.GetName())
+	} else if !errors.Is(err, command.ErrNotFound) {
+		return nil, status.Errorf(codes.Internal, "failed to look up volume: %v", err)
 	}
 
-	// From here on the snapshot LV exists. If a later step fails, remove it, so
-	// that an incomplete snapshot (at the wrong size, or writable when it should
-	// be read-only) is never left behind to be mistaken for a finished one.
-	// The caller records the failure and retries from scratch.
+	// From lvcreate -s on, the snapshot LV may exist. If any step fails, remove
+	// it, so that an incomplete snapshot (at the wrong size, or writable when
+	// it should be read-only) is never left behind to be mistaken for a
+	// finished one; the caller records the failure and retries from scratch.
+	// This includes lvcreate -s itself: when the call is cancelled while it
+	// runs, the lvm process can still create the LV after lvmd stops waiting.
+	// The removal runs under a context of its own, because a cancelled call is
+	// the common reason to clean up.
 	fail := func(msg string, err error) (*proto.CreateLVSnapshotResponse, error) {
 		logger.Error(err, msg)
-		if rmErr := vg.RemoveVolume(ctx, req.GetName()); rmErr != nil {
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), snapshotCleanupTimeout)
+		defer cancel()
+		if rmErr := vg.RemoveVolume(cleanupCtx, req.GetName()); rmErr != nil && !errors.Is(rmErr, command.ErrNotFound) {
 			logger.Error(rmErr, "failed to delete incomplete snapshot volume")
-		} else {
+		} else if rmErr == nil {
 			logger.Info("deleted incomplete snapshot volume")
 		}
 		return nil, status.Error(codes.Internal, err.Error())
+	}
+
+	if err := sourceLV.ThinSnapshot(ctx, req.GetName(), req.GetTags()); err != nil {
+		return fail("failed to create snapshot volume", err)
 	}
 
 	snapLV, err := vg.LookupVolume(ctx, req.GetName())
