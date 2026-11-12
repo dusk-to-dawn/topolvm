@@ -3,6 +3,8 @@ package controller
 import (
 	"context"
 	"fmt"
+	"slices"
+	"sync"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -11,6 +13,8 @@ import (
 	topolvmv1 "github.com/topolvm/topolvm/api/v1"
 	"github.com/topolvm/topolvm/pkg/lvmd/proto"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
 	storegev1 "k8s.io/api/storage/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -22,7 +26,25 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/metrics/server"
 )
 
-var volumes = &[]*proto.LogicalVolume{}
+// mockLVMD holds the state shared by the mock lvmd clients below.
+var mockLVMD = struct {
+	sync.Mutex
+	volumes      []*proto.LogicalVolume
+	getLVListN   int
+	createLVHook func(in *proto.CreateLVRequest) error
+}{}
+
+func mockLVMDGetLVListCalls() int {
+	mockLVMD.Lock()
+	defer mockLVMD.Unlock()
+	return mockLVMD.getLVListN
+}
+
+func setMockCreateLVHook(hook func(in *proto.CreateLVRequest) error) {
+	mockLVMD.Lock()
+	defer mockLVMD.Unlock()
+	mockLVMD.createLVHook = hook
+}
 
 type MockVGServiceClient struct {
 }
@@ -34,8 +56,11 @@ func (MockVGServiceClient) GetFreeBytes(ctx context.Context, in *proto.GetFreeBy
 
 // GetLVList implements proto.VGServiceClient.
 func (c MockVGServiceClient) GetLVList(ctx context.Context, in *proto.GetLVListRequest, opts ...grpc.CallOption) (*proto.GetLVListResponse, error) {
+	mockLVMD.Lock()
+	defer mockLVMD.Unlock()
+	mockLVMD.getLVListN++
 	return &proto.GetLVListResponse{
-		Volumes: *volumes,
+		Volumes: slices.Clone(mockLVMD.volumes),
 	}, nil
 }
 
@@ -49,11 +74,18 @@ type MockLVServiceClient struct {
 
 // CreateLV implements proto.LVServiceClient.
 func (c MockLVServiceClient) CreateLV(ctx context.Context, in *proto.CreateLVRequest, opts ...grpc.CallOption) (*proto.CreateLVResponse, error) {
+	mockLVMD.Lock()
+	defer mockLVMD.Unlock()
 	lv := proto.LogicalVolume{
 		Name:      in.Name,
 		SizeBytes: in.SizeBytes,
 	}
-	*volumes = append(*volumes, &lv)
+	mockLVMD.volumes = append(mockLVMD.volumes, &lv)
+	if mockLVMD.createLVHook != nil {
+		if err := mockLVMD.createLVHook(in); err != nil {
+			return nil, err
+		}
+	}
 	createResponse := proto.CreateLVResponse{
 		Volume: &lv,
 	}
@@ -72,7 +104,7 @@ func (MockLVServiceClient) RemoveLV(ctx context.Context, in *proto.RemoveLVReque
 
 // ResizeLV implements proto.LVServiceClient.
 func (MockLVServiceClient) ResizeLV(ctx context.Context, in *proto.ResizeLVRequest, opts ...grpc.CallOption) (*proto.ResizeLVResponse, error) {
-	panic("unimplemented")
+	return &proto.ResizeLVResponse{SizeBytes: in.SizeBytes}, nil
 }
 
 var _ = Describe("LogicalVolume controller", func() {
@@ -230,6 +262,67 @@ var _ = Describe("LogicalVolume controller", func() {
 			return !controllerutil.ContainsFinalizer(&lv, topolvm.GetLogicalVolumeFinalizer())
 		}, "2s").Should(BeTrue())
 	})
+	waitForVolumeID := func(ctx context.Context, lv *topolvmv1.LogicalVolume) {
+		GinkgoHelper()
+		Eventually(func(g Gomega) {
+			g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(lv), lv)).To(Succeed())
+			g.Expect(lv.Status.VolumeID).To(Equal(string(lv.UID)))
+			g.Expect(lv.Status.Code).To(Equal(codes.OK))
+		}).Should(Succeed())
+	}
+
+	It("should create LV without listing the volumes first", func() {
+		setMockCreateLVHook(nil)
+		startReconciler("-create")
+		ctx := context.Background()
+		before := mockLVMDGetLVListCalls()
+
+		lv := setupResources(ctx, "-create")
+		waitForVolumeID(ctx, &lv)
+		Expect(lv.Status.CurrentSize).NotTo(BeNil())
+		Expect(mockLVMDGetLVListCalls()).To(Equal(before))
+	})
+
+	It("should adopt an existing LV that lvmd reports as AlreadyExists", func() {
+		setMockCreateLVHook(func(in *proto.CreateLVRequest) error {
+			return status.Error(codes.AlreadyExists, "exists")
+		})
+		DeferCleanup(func() { setMockCreateLVHook(nil) })
+		startReconciler("-already-exists")
+		ctx := context.Background()
+
+		lv := setupResources(ctx, "-already-exists")
+		waitForVolumeID(ctx, &lv)
+	})
+
+	It("should adopt an existing LV when an older lvmd fails to create it", func() {
+		setMockCreateLVHook(func(in *proto.CreateLVRequest) error {
+			return status.Error(codes.Internal, "Logical Volume already exists in volume group")
+		})
+		DeferCleanup(func() { setMockCreateLVHook(nil) })
+		startReconciler("-old-lvmd")
+		ctx := context.Background()
+
+		lv := setupResources(ctx, "-old-lvmd")
+		waitForVolumeID(ctx, &lv)
+	})
+
+	It("should record the error when creation fails and the LV does not exist", func() {
+		setMockCreateLVHook(func(in *proto.CreateLVRequest) error {
+			mockLVMD.volumes = slices.DeleteFunc(mockLVMD.volumes, func(v *proto.LogicalVolume) bool { return v.Name == in.Name })
+			return status.Error(codes.ResourceExhausted, "no space")
+		})
+		DeferCleanup(func() { setMockCreateLVHook(nil) })
+		startReconciler("-fail")
+		ctx := context.Background()
+
+		lv := setupResources(ctx, "-fail")
+		Eventually(func(g Gomega) {
+			g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(&lv), &lv)).To(Succeed())
+			g.Expect(lv.Status.Code).To(Equal(codes.ResourceExhausted))
+			g.Expect(lv.Status.VolumeID).To(BeEmpty())
+		}).Should(Succeed())
+	})
 })
 
 // fakeLVM stands in for the LVM state lvmd reports for one node. It serves the
@@ -240,6 +333,21 @@ type fakeLVM struct {
 
 	volumes     []*proto.LogicalVolume
 	resizeCalls int
+	createCalls int
+	resizeErr   error
+}
+
+// CreateLV implements proto.LVServiceClient. Like lvmd, it refuses a name that exists.
+func (f *fakeLVM) CreateLV(ctx context.Context, in *proto.CreateLVRequest, opts ...grpc.CallOption) (*proto.CreateLVResponse, error) {
+	f.createCalls++
+	for _, v := range f.volumes {
+		if v.Name == in.Name {
+			return nil, status.Errorf(codes.AlreadyExists, "logical volume %s already exists", in.Name)
+		}
+	}
+	v := &proto.LogicalVolume{Name: in.Name, SizeBytes: in.SizeBytes}
+	f.volumes = append(f.volumes, v)
+	return &proto.CreateLVResponse{Volume: v}, nil
 }
 
 // GetLVList implements proto.VGServiceClient.
@@ -252,6 +360,9 @@ func (f *fakeLVM) GetLVList(ctx context.Context, in *proto.GetLVListRequest, opt
 // ResizeLV implements proto.LVServiceClient.
 func (f *fakeLVM) ResizeLV(ctx context.Context, in *proto.ResizeLVRequest, opts ...grpc.CallOption) (*proto.ResizeLVResponse, error) {
 	f.resizeCalls++
+	if f.resizeErr != nil {
+		return nil, f.resizeErr
+	}
 	for _, v := range f.volumes {
 		if v.Name == in.Name {
 			v.SizeBytes = in.SizeBytes
@@ -313,7 +424,108 @@ var _ = Describe("LogicalVolume controller createLV", func() {
 		Expect(readBack().Status.CurrentSize.Value()).To(Equal(int64(actualSizeBytes)))
 		Expect(lvm.resizeCalls).To(Equal(0))
 	})
+
+	It("should keep currentSize after adopting an LV smaller than spec.size when the resize fails", func() {
+		ctx := context.Background()
+
+		// The LV exists at a smaller size, as after a crash between creating it and
+		// recording it while spec.size was raised.
+		const (
+			specSizeBytes   = 2 << 30
+			actualSizeBytes = 1 << 30
+		)
+		lv := topolvmv1.LogicalVolume{
+			ObjectMeta: metav1.ObjectMeta{Name: logicalVolumeNameBase + "-adopt-then-resize-fails"},
+			Spec: topolvmv1.LogicalVolumeSpec{
+				NodeName: nodeNameBase + "-adopt-then-resize-fails",
+				Size:     *resource.NewQuantity(specSizeBytes, resource.BinarySI),
+			},
+		}
+		Expect(k8sClient.Create(ctx, &lv)).To(Succeed())
+
+		lvm := &fakeLVM{
+			volumes:   []*proto.LogicalVolume{{Name: string(lv.UID), SizeBytes: actualSizeBytes}},
+			resizeErr: status.Error(codes.ResourceExhausted, "no enough space left on VG"),
+		}
+		reconciler := NewLogicalVolumeReconcilerWithServices(k8sClient, lv.Spec.NodeName, lvm, lvm)
+
+		By("adopting the LV after lvmd reports AlreadyExists, with its real size")
+		Expect(reconciler.createLV(ctx, GinkgoLogr, &lv)).To(Succeed())
+		Expect(lvm.createCalls).To(Equal(1))
+		var updated topolvmv1.LogicalVolume
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(&lv), &updated)).To(Succeed())
+		Expect(updated.Status.VolumeID).To(Equal(string(lv.UID)))
+		Expect(updated.Status.CurrentSize).NotTo(BeNil())
+		Expect(updated.Status.CurrentSize.Value()).To(Equal(int64(actualSizeBytes)))
+
+		By("recording the failed resize without losing currentSize")
+		Expect(reconciler.expandLV(ctx, GinkgoLogr, &updated)).NotTo(Succeed())
+		Expect(lvm.resizeCalls).To(Equal(1))
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(&lv), &updated)).To(Succeed())
+		Expect(updated.Status.Code).To(Equal(codes.ResourceExhausted))
+		Expect(updated.Status.CurrentSize).NotTo(BeNil())
+		Expect(updated.Status.CurrentSize.Value()).To(Equal(int64(actualSizeBytes)))
+	})
+
+	It("should look a snapshot up before creating it and not adopt one after a failure", func() {
+		ctx := context.Background()
+
+		source := topolvmv1.LogicalVolume{
+			ObjectMeta: metav1.ObjectMeta{Name: logicalVolumeNameBase + "-snap-source"},
+			Spec: topolvmv1.LogicalVolumeSpec{
+				NodeName: nodeNameBase + "-snap-source",
+				Size:     *resource.NewQuantity(1<<30, resource.BinarySI),
+			},
+		}
+		Expect(k8sClient.Create(ctx, &source)).To(Succeed())
+		source.Status.VolumeID = string(source.UID)
+		source.Status.CurrentSize = resource.NewQuantity(1<<30, resource.BinarySI)
+		Expect(k8sClient.Status().Update(ctx, &source)).To(Succeed())
+
+		snap := topolvmv1.LogicalVolume{
+			ObjectMeta: metav1.ObjectMeta{Name: logicalVolumeNameBase + "-snap-half-done"},
+			Spec: topolvmv1.LogicalVolumeSpec{
+				NodeName:   source.Spec.NodeName,
+				Size:       *resource.NewQuantity(2<<30, resource.BinarySI),
+				Source:     source.Name,
+				AccessType: "rw",
+			},
+		}
+		Expect(k8sClient.Create(ctx, &snap)).To(Succeed())
+
+		// lvmd created the clone at the source's size, then failed to extend it.
+		lvm := &snapshotFailingLVM{fakeLVM: fakeLVM{}, leaveSize: 1 << 30}
+		reconciler := NewLogicalVolumeReconcilerWithServices(k8sClient, snap.Spec.NodeName, lvm, lvm)
+
+		Expect(reconciler.createLV(ctx, GinkgoLogr, &snap)).NotTo(Succeed())
+		var updated topolvmv1.LogicalVolume
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(&snap), &updated)).To(Succeed())
+		Expect(updated.Status.Code).To(Equal(codes.Internal))
+		Expect(updated.Status.VolumeID).To(BeEmpty())
+		// One look-up before the attempt, none after it.
+		Expect(lvm.listCalls).To(Equal(1))
+	})
 })
+
+// snapshotFailingLVM fails CreateLVSnapshot after leaving a partial LV behind,
+// as lvmd did before it cleaned up after every failed step.
+type snapshotFailingLVM struct {
+	fakeLVM
+	leaveSize int64
+	listCalls int
+}
+
+// GetLVList implements proto.VGServiceClient.
+func (f *snapshotFailingLVM) GetLVList(ctx context.Context, in *proto.GetLVListRequest, opts ...grpc.CallOption) (*proto.GetLVListResponse, error) {
+	f.listCalls++
+	return f.fakeLVM.GetLVList(ctx, in, opts...)
+}
+
+// CreateLVSnapshot implements proto.LVServiceClient.
+func (f *snapshotFailingLVM) CreateLVSnapshot(ctx context.Context, in *proto.CreateLVSnapshotRequest, opts ...grpc.CallOption) (*proto.CreateLVSnapshotResponse, error) {
+	f.volumes = append(f.volumes, &proto.LogicalVolume{Name: in.Name, SizeBytes: f.leaveSize})
+	return nil, status.Error(codes.Internal, "failed to resize snapshot volume")
+}
 
 var _ = Describe("LogicalVolume controller createLV with a source", func() {
 	It("should fail without panicking when the source has no currentSize yet", func() {

@@ -187,85 +187,37 @@ func (r *LogicalVolumeReconciler) createLV(ctx context.Context, log logr.Logger,
 	reqBytes := lv.Spec.Size.Value()
 
 	err := func() error {
-		// In case the controller crashed just after LVM LV creation, LV may already exist.
-		existingLV, err := r.findVolume(ctx, log, lv)
-		if err != nil {
-			lv.Status.Code = codes.Internal
-			lv.Status.Message = "failed to check volume existence"
-			return err
+		// In case topolvm-node stopped just after LVM LV creation, LV may already exist.
+		if lv.Spec.Source != "" {
+			// A snapshot or clone is created in several LVM steps, so a failed attempt
+			// can leave an incomplete LV behind. Look it up before creating, as before,
+			// and never adopt it after a failure: the failure is recorded instead, and
+			// the controller deletes and retries the LogicalVolume.
+			existingLV, err := r.findVolume(ctx, log, lv)
+			if err != nil {
+				lv.Status.Code = codes.Internal
+				lv.Status.Message = "failed to check volume existence"
+				return err
+			}
+			if existingLV != nil {
+				r.adoptLV(log, lv, existingLV)
+				return nil
+			}
+			return r.createLVOnce(ctx, log, lv, reqBytes)
 		}
-		if existingLV != nil {
-			log.Info("set volumeID to existing LogicalVolume", "name", lv.Name, "uid", lv.UID, "status.volumeID", lv.Status.VolumeID)
-			lv.Status.VolumeID = string(lv.UID)
-			// Spec.Size is the requested size, not the size LVM allocated.
-			lv.Status.CurrentSize = resource.NewQuantity(existingLV.SizeBytes, resource.BinarySI)
-			lv.Status.Code = codes.OK
-			lv.Status.Message = ""
+
+		// A regular LV is created by a single lvcreate, so it is created first and
+		// looked up only when that fails: lvmd reports an existing LV as AlreadyExists,
+		// and an older lvmd fails in lvcreate.
+		err := r.createLVOnce(ctx, log, lv, reqBytes)
+		if err == nil {
 			return nil
 		}
-
-		var volume *proto.LogicalVolume
-
-		// Create a snapshot LV
-		if lv.Spec.Source != "" {
-			// accessType should be either "readonly" or "readwrite".
-			if lv.Spec.AccessType != "ro" && lv.Spec.AccessType != "rw" {
-				return fmt.Errorf("invalid access type for source volume: %s", lv.Spec.AccessType)
-			}
-			sourcelv := new(topolvmv1.LogicalVolume)
-			if err := r.client.Get(ctx, types.NamespacedName{Namespace: lv.Namespace, Name: lv.Spec.Source}, sourcelv); err != nil {
-				log.Error(err, "unable to fetch source LogicalVolume", "name", lv.Name)
-				return err
-			}
-			if sourcelv.Status.CurrentSize == nil {
-				// Spec.Size is the requested size, not the size LVM allocated.
-				return fmt.Errorf("source LogicalVolume %s has no status.currentSize yet", sourcelv.Name)
-			}
-
-			sourceVolID := sourcelv.Status.VolumeID
-			currentSize := sourcelv.Status.CurrentSize.Value()
-			if reqBytes < currentSize {
-				return fmt.Errorf("cannot create new LV, requested size %d is smaller than source LV size %d", reqBytes, currentSize)
-			}
-
-			// Create a snapshot lv
-			resp, err := r.lvService.CreateLVSnapshot(ctx, &proto.CreateLVSnapshotRequest{
-				Name:         string(lv.UID),
-				DeviceClass:  lv.Spec.DeviceClass,
-				SourceVolume: sourceVolID,
-				SizeBytes:    reqBytes,
-				AccessType:   lv.Spec.AccessType,
-			})
-			if err != nil {
-				code, message := extractFromError(err)
-				log.Error(err, message)
-				lv.Status.Code = code
-				lv.Status.Message = message
-				return err
-			}
-			volume = resp.Snapshot
-		} else {
-			// Create a regular lv
-			resp, err := r.lvService.CreateLV(ctx, &proto.CreateLVRequest{
-				Name:                string(lv.UID),
-				DeviceClass:         lv.Spec.DeviceClass,
-				LvcreateOptionClass: lv.Spec.LvcreateOptionClass,
-				SizeBytes:           reqBytes,
-			})
-			if err != nil {
-				code, message := extractFromError(err)
-				log.Error(err, message)
-				lv.Status.Code = code
-				lv.Status.Message = message
-				return err
-			}
-			volume = resp.Volume
+		existingLV, findErr := r.findVolume(ctx, log, lv)
+		if findErr != nil || existingLV == nil {
+			return err
 		}
-
-		lv.Status.VolumeID = volume.Name
-		lv.Status.CurrentSize = resource.NewQuantity(volume.SizeBytes, resource.BinarySI)
-		lv.Status.Code = codes.OK
-		lv.Status.Message = ""
+		r.adoptLV(log, lv, existingLV)
 		return nil
 	}()
 
@@ -283,6 +235,83 @@ func (r *LogicalVolumeReconciler) createLV(ctx context.Context, log logr.Logger,
 	}
 
 	log.Info("created new LV", "name", lv.Name, "uid", lv.UID, "status.volumeID", lv.Status.VolumeID)
+	return nil
+}
+
+// adoptLV records an existing LVM LV, found by its name, as the volume of lv.
+func (r *LogicalVolumeReconciler) adoptLV(log logr.Logger, lv *topolvmv1.LogicalVolume, existingLV *proto.LogicalVolume) {
+	log.Info("set volumeID to existing LogicalVolume", "name", lv.Name, "uid", lv.UID, "status.volumeID", lv.Status.VolumeID)
+	lv.Status.VolumeID = string(lv.UID)
+	// Spec.Size is the requested size, not the size LVM allocated.
+	lv.Status.CurrentSize = resource.NewQuantity(existingLV.SizeBytes, resource.BinarySI)
+	lv.Status.Code = codes.OK
+	lv.Status.Message = ""
+}
+
+// createLVOnce asks lvmd to create the LV, or the snapshot it is restored from, and records the result in lv.Status.
+func (r *LogicalVolumeReconciler) createLVOnce(ctx context.Context, log logr.Logger, lv *topolvmv1.LogicalVolume, reqBytes int64) error {
+	var volume *proto.LogicalVolume
+
+	// Create a snapshot LV
+	if lv.Spec.Source != "" {
+		// accessType should be either "readonly" or "readwrite".
+		if lv.Spec.AccessType != "ro" && lv.Spec.AccessType != "rw" {
+			return fmt.Errorf("invalid access type for source volume: %s", lv.Spec.AccessType)
+		}
+		sourcelv := new(topolvmv1.LogicalVolume)
+		if err := r.client.Get(ctx, types.NamespacedName{Namespace: lv.Namespace, Name: lv.Spec.Source}, sourcelv); err != nil {
+			log.Error(err, "unable to fetch source LogicalVolume", "name", lv.Name)
+			return err
+		}
+		if sourcelv.Status.CurrentSize == nil {
+			// Spec.Size is the requested size, not the size LVM allocated.
+			return fmt.Errorf("source LogicalVolume %s has no status.currentSize yet", sourcelv.Name)
+		}
+
+		sourceVolID := sourcelv.Status.VolumeID
+		currentSize := sourcelv.Status.CurrentSize.Value()
+		if reqBytes < currentSize {
+			return fmt.Errorf("cannot create new LV, requested size %d is smaller than source LV size %d", reqBytes, currentSize)
+		}
+
+		// Create a snapshot lv
+		resp, err := r.lvService.CreateLVSnapshot(ctx, &proto.CreateLVSnapshotRequest{
+			Name:         string(lv.UID),
+			DeviceClass:  lv.Spec.DeviceClass,
+			SourceVolume: sourceVolID,
+			SizeBytes:    reqBytes,
+			AccessType:   lv.Spec.AccessType,
+		})
+		if err != nil {
+			code, message := extractFromError(err)
+			log.Error(err, message)
+			lv.Status.Code = code
+			lv.Status.Message = message
+			return err
+		}
+		volume = resp.Snapshot
+	} else {
+		// Create a regular lv
+		resp, err := r.lvService.CreateLV(ctx, &proto.CreateLVRequest{
+			Name:                string(lv.UID),
+			DeviceClass:         lv.Spec.DeviceClass,
+			LvcreateOptionClass: lv.Spec.LvcreateOptionClass,
+			SizeBytes:           reqBytes,
+		})
+		if err != nil {
+			code, message := extractFromError(err)
+			log.Error(err, message)
+			lv.Status.Code = code
+			lv.Status.Message = message
+			return err
+		}
+		volume = resp.Volume
+	}
+
+	lv.Status.VolumeID = volume.Name
+	lv.Status.CurrentSize = resource.NewQuantity(volume.SizeBytes, resource.BinarySI)
+	lv.Status.Code = codes.OK
+	lv.Status.Message = ""
 	return nil
 }
 
