@@ -39,6 +39,11 @@ func SetLVMCommandPrefix(prefix []string) {
 	lvmCommandPrefix = prefix
 }
 
+// LVMCommandPrefix returns a copy of the prefix used to run LVM commands.
+func LVMCommandPrefix() []string {
+	return slices.Clone(lvmCommandPrefix)
+}
+
 // callLVM calls lvm sub-commands and prints the output to the log.
 func callLVM(ctx context.Context, args ...string) error {
 	return callLVMInto(ctx, nil, verbosityLVMStateUpdate, args...)
