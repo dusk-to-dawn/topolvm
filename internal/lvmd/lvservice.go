@@ -16,9 +16,10 @@ import (
 // NewLVService creates a new LVServiceServer
 func NewLVService(dcmapper *DeviceClassManager, ocmapper *LvcreateOptionClassManager, notifyFunc func()) proto.LVServiceServer {
 	return &lvService{
-		dcmapper:   dcmapper,
-		ocmapper:   ocmapper,
-		notifyFunc: notifyFunc,
+		dcmapper:     dcmapper,
+		ocmapper:     ocmapper,
+		notifyFunc:   notifyFunc,
+		reservations: newReservations(),
 	}
 }
 
@@ -27,6 +28,8 @@ type lvService struct {
 	dcmapper   *DeviceClassManager
 	ocmapper   *LvcreateOptionClassManager
 	notifyFunc func()
+	// reservations keeps concurrent calls from overcommitting capacity.
+	reservations *reservations
 }
 
 func (s *lvService) notify() {
@@ -42,6 +45,8 @@ func (s *lvService) CreateLV(ctx context.Context, req *proto.CreateLVRequest) (*
 	if err != nil {
 		return nil, status.Errorf(codes.NotFound, "%s: %s", err.Error(), req.DeviceClass)
 	}
+	capacityCheck := s.reservations.begin(reservationKey(dc))
+	defer capacityCheck.close()
 	pool, err := storagePoolForDeviceClass(ctx, dc)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to get pool from device class: %v", err)
@@ -65,10 +70,12 @@ func (s *lvService) CreateLV(ctx context.Context, req *proto.CreateLVRequest) (*
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to get free bytes: %v", err)
 	}
-	if free < requested {
+	reserved, free := capacityCheck.reserve(free, requested)
+	if reserved == nil {
 		logger.Error(err, "not enough space left on VG", "free", free, "requested", requested)
 		return nil, status.Errorf(codes.ResourceExhausted, "no enough space left on VG: free=%d, requested=%d", free, requested)
 	}
+	defer s.reservations.release(reserved)
 
 	var stripe uint
 	var stripeSize string
@@ -161,6 +168,8 @@ func (s *lvService) CreateLVSnapshot(ctx context.Context, req *proto.CreateLVSna
 		return nil, status.Errorf(codes.InvalidArgument, "invalid device class type %v", string(dc.Type))
 	}
 
+	capacityCheck := s.reservations.begin(reservationKey(dc))
+	defer capacityCheck.close()
 	// One report answers the look-ups of the source volume, the pool and its
 	// usage below.
 	vg, err := command.FindVolumeGroupWithVolumes(ctx, dc.VolumeGroup)
@@ -212,10 +221,12 @@ func (s *lvService) CreateLVSnapshot(ctx context.Context, req *proto.CreateLVSna
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to get free bytes: %v", err)
 	}
-	if free < desiredSize {
+	reserved, free := capacityCheck.reserve(free, desiredSize)
+	if reserved == nil {
 		logger.Error(err, "not enough space left on VG", "free", free, "desiredSize", desiredSize)
 		return nil, status.Errorf(codes.ResourceExhausted, "no enough space left on VG: free=%d, desiredSize=%d", free, desiredSize)
 	}
+	defer s.reservations.release(reserved)
 
 	logger.Info(
 		"lvservice req",
@@ -282,6 +293,8 @@ func (s *lvService) ResizeLV(ctx context.Context, req *proto.ResizeLVRequest) (*
 	if err != nil {
 		return nil, status.Errorf(codes.NotFound, "%s: %s", err.Error(), req.DeviceClass)
 	}
+	capacityCheck := s.reservations.begin(reservationKey(dc))
+	defer capacityCheck.close()
 	pool, err := storagePoolForDeviceClass(ctx, dc)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to get pool from device class: %v", err)
@@ -317,7 +330,8 @@ func (s *lvService) ResizeLV(ctx context.Context, req *proto.ResizeLVRequest) (*
 		"free", free,
 	)
 
-	if free < (requested - current) {
+	reserved, free := capacityCheck.reserve(free, requested-current)
+	if reserved == nil {
 		logger.Error(err, "no enough space left on VG",
 			"requested", requested,
 			"current", current,
@@ -325,6 +339,7 @@ func (s *lvService) ResizeLV(ctx context.Context, req *proto.ResizeLVRequest) (*
 		)
 		return nil, status.Errorf(codes.ResourceExhausted, "no enough space left on VG: free=%d, requested=%d", free, requested-current)
 	}
+	defer s.reservations.release(reserved)
 
 	err = lv.Resize(ctx, requested)
 	if err != nil {
