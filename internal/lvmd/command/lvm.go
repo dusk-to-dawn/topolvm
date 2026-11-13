@@ -575,15 +575,32 @@ func (l *LogicalVolume) Attr() string {
 	return l.attr
 }
 
-// ThinSnapshot takes a thin snapshot of a volume.
+// IsInactive reports whether the volume had no device-mapper device when it
+// was listed: lv_attr shows no state.
+func (l *LogicalVolume) IsInactive() bool {
+	return len(l.attr) > 4 && l.attr[4] == '-'
+}
+
+// PoolName returns the name of the thin pool of a thin volume, or "".
+func (l *LogicalVolume) PoolName() string {
+	if l.pool == nil {
+		return ""
+	}
+	return *l.pool
+}
+
+// ThinSnapshot takes a thin snapshot of a volume, inactive and without the
+// activation-skip flag. Taking it suspends only the origin, if that is active.
+// While the snapshot is inactive, resizing, making it read-only and renaming it
+// change LVM metadata only: no device, of it or of its thin pool, is
+// suspended. Activate it last.
 // The volume must be thinly-provisioned.
-// snapshots can be created unconditionally.
 func (l *LogicalVolume) ThinSnapshot(ctx context.Context, name string, tags []string) error {
 	if !l.IsThin() {
 		return fmt.Errorf("cannot take snapshot of non-thin volume: %s", l.fullname)
 	}
 
-	lvcreateArgs := []string{cmdLVCreate, "-s", "-k", "n", "-n", name, l.fullname}
+	lvcreateArgs := []string{cmdLVCreate, "-s", "-k", "n", "-a", "n", "-n", name, l.fullname}
 
 	for _, tag := range tags {
 		lvcreateArgs = append(lvcreateArgs, "--addtag")
@@ -593,19 +610,16 @@ func (l *LogicalVolume) ThinSnapshot(ctx context.Context, name string, tags []st
 	return callLVM(ctx, lvcreateArgs...)
 }
 
-// Activate activates the logical volume for desired access.
-func (l *LogicalVolume) Activate(ctx context.Context, access string) error {
-	var lvchangeArgs []string
-	switch access {
-	case "ro":
-		lvchangeArgs = []string{"lvchange", "-p", "r", l.path}
-	case "rw":
-		lvchangeArgs = []string{"lvchange", "-k", "n", "-a", "y", l.path}
-	default:
-		return fmt.Errorf("unknown access: %s for LogicalVolume %s", access, l.fullname)
-	}
+// SetReadOnly makes the logical volume read-only. On an inactive volume this
+// changes metadata only.
+func (l *LogicalVolume) SetReadOnly(ctx context.Context) error {
+	return callLVM(ctx, "lvchange", "-p", "r", l.fullname)
+}
 
-	return callLVM(ctx, lvchangeArgs...)
+// Activate clears the activation-skip flag of the logical volume and activates
+// it. It does nothing to a volume that is active already.
+func (l *LogicalVolume) Activate(ctx context.Context) error {
+	return callLVM(ctx, "lvchange", "-k", "n", "-a", "y", l.fullname)
 }
 
 // Resize this volume.

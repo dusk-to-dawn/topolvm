@@ -29,11 +29,16 @@ the chart's lvmd DaemonSet does. topolvm-node with `--embed-lvmd` takes the same
 host. An lvmd older than this one takes no lock, so while either side is older, run only one lvmd
 Pod on a node at a time.
 
-Snapshots and clones are built under a temporary name, the volume's name followed by
-`.creating-` and 16 hexadecimal digits, and renamed to the volume's name as the last step.
-If lvmd stops before that, it removes such leftovers the next time it starts. While it runs, it
-also removes, at most every 5 minutes and from the report it takes for topolvm-node's watch, any
-such LV that none of its own calls is building: one whose clean-up failed, or one that the `lvm`
+Snapshots and clones are built inactive under a temporary name, the volume's name followed by
+`.creating-` and 16 hexadecimal digits: created, extended and made read-only as requested, then
+renamed to the volume's name, and activated under it as the last step. On an inactive LV, extending
+it, changing its permission and renaming it change LVM metadata only; on an active thin LV, LVM
+suspends the LV and its whole thin pool for each of them. Taking the snapshot suspends only its
+origin, if that is active, and the activation adds one device. A snapshot that has its name but is
+still inactive is complete: its call stopped before the activation, and the next request for it
+activates it. If lvmd stops before the rename, it removes the build the next time it starts. While
+it runs, it also removes, at most every 5 minutes and from the report it takes for topolvm-node's
+watch, any build that none of its own calls is making: one whose clean-up failed, or one that the `lvm`
 process of a cancelled call created after the call had cleaned up.
 If removing one after a failed call fails too, the call's error says so, and lvmd counts it in
 `topolvm_lvmd_incomplete_snapshot_cleanup_failures_total`, served with lvmd's metrics, or with

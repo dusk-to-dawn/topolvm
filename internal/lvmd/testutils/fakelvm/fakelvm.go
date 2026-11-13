@@ -69,7 +69,8 @@ type VG struct {
 	LVs  []*LV  `json:"lvs"`
 }
 
-// LV is a fake logical volume, thin pool or thin volume.
+// LV is a fake logical volume, thin pool or thin volume. The zero value of
+// the flags is an active, writable LV without the activation-skip flag.
 type LV struct {
 	Name   string   `json:"name"`
 	Size   uint64   `json:"size"`
@@ -78,6 +79,10 @@ type LV struct {
 	IsPool bool     `json:"isPool,omitempty"`
 	Tags   []string `json:"tags,omitempty"`
 	Minor  uint32   `json:"minor"`
+
+	Inactive       bool `json:"inactive,omitempty"`
+	ReadOnly       bool `json:"readOnly,omitempty"`
+	SkipActivation bool `json:"skipActivation,omitempty"`
 }
 
 var build struct {
@@ -406,7 +411,8 @@ func Main(args []string) int {
 		code = lvrename(state, pos)
 		modified = code == 0
 	case "lvchange":
-		code = 0
+		code = lvchange(state, opts, pos)
+		modified = code == 0
 	default:
 		fmt.Fprintf(os.Stderr, "fake lvm does not implement %q\n", cmd)
 		return exitUsage
@@ -489,7 +495,7 @@ func lvNotFound(full string) int {
 
 // splitTarget splits "vg" or "vg/lv".
 func splitTarget(t string) (string, string) {
-	vg, lv, _ := strings.Cut(t, "/")
+	vg, lv, _ := strings.Cut(strings.TrimPrefix(t, "/dev/"), "/")
 	return vg, lv
 }
 
@@ -503,12 +509,24 @@ func vgRow(vg *VG) map[string]string {
 }
 
 func lvRow(vg *VG, lv *LV) map[string]string {
-	attr := attrThick
+	base := attrThick
 	switch {
 	case lv.IsPool:
-		attr = attrThinPool
+		base = attrThinPool
 	case lv.Pool != "":
-		attr = attrThinVolume
+		base = attrThinVolume
+	}
+	attr := []byte(base)
+	major, minor := "253", strconv.FormatUint(uint64(lv.Minor), 10)
+	if lv.ReadOnly {
+		attr[1] = 'r'
+	}
+	if lv.Inactive {
+		attr[4] = '-'
+		major, minor = "-1", "-1"
+	}
+	if lv.SkipActivation {
+		attr[9] = 'k'
 	}
 	originSize := ""
 	if lv.Origin != "" {
@@ -526,13 +544,13 @@ func lvRow(vg *VG, lv *LV) map[string]string {
 		"lv_full_name":     vg.Name + "/" + lv.Name,
 		"lv_path":          "/dev/" + vg.Name + "/" + lv.Name,
 		"lv_size":          strconv.FormatUint(lv.Size, 10),
-		"lv_kernel_major":  "253",
-		"lv_kernel_minor":  strconv.FormatUint(uint64(lv.Minor), 10),
+		"lv_kernel_major":  major,
+		"lv_kernel_minor":  minor,
 		"origin":           lv.Origin,
 		"origin_size":      originSize,
 		"pool_lv":          lv.Pool,
 		"lv_tags":          strings.Join(lv.Tags, ","),
-		"lv_attr":          attr,
+		"lv_attr":          string(attr),
 		"vg_name":          vg.Name,
 		"data_percent":     dataPercent,
 		"metadata_percent": metaPercent,
@@ -656,7 +674,11 @@ func lvcreate(s *State, opts map[string][]string, pos []string) int {
 		fmt.Fprintf(os.Stderr, "  Logical Volume \"%s\" already exists in volume group \"%s\"\n", name, vgName)
 		return exitNotFound
 	}
-	lv := &LV{Name: name, Tags: opts["--addtag"]}
+	lv := &LV{Name: name, Tags: opts["--addtag"], ReadOnly: first(opts, "-p") == "r"}
+	// Like LVM, a thin snapshot gets the activation-skip flag unless -k n, and
+	// is not activated while it has it, nor with -a n.
+	lv.SkipActivation = origin != "" && first(opts, "-k") != "n"
+	lv.Inactive = first(opts, "-a") == "n" || (lv.SkipActivation && len(opts["-K"]) == 0)
 	switch {
 	case pool != "":
 		p := vg.lv(pool)
@@ -733,6 +755,47 @@ func lvrename(s *State, pos []string) int {
 		}
 	}
 	fmt.Printf("  Renamed \"%s\" to \"%s\" in volume group \"%s\"\n", pos[1], pos[2], pos[0])
+	return 0
+}
+
+// lvchange changes the permission (-p), the activation-skip flag (-k) and
+// then the activation (-a) of an LV, in that order, as LVM does. Like LVM,
+// it does not activate an LV with the activation-skip flag without -K.
+func lvchange(s *State, opts map[string][]string, pos []string) int {
+	if len(pos) != 1 {
+		return exitUsage
+	}
+	vgName, lvName := splitTarget(pos[0])
+	vg := s.vg(vgName)
+	if vg == nil {
+		return vgNotFound(vgName)
+	}
+	lv := vg.lv(lvName)
+	if lv == nil {
+		return lvNotFound(pos[0])
+	}
+	switch first(opts, "-p") {
+	case "r":
+		lv.ReadOnly = true
+	case "rw":
+		lv.ReadOnly = false
+	}
+	switch first(opts, "-k") {
+	case "y":
+		lv.SkipActivation = true
+	case "n":
+		lv.SkipActivation = false
+	}
+	switch first(opts, "-a") {
+	case "y":
+		if lv.SkipActivation && len(opts["-K"]) == 0 {
+			fmt.Fprintf(os.Stderr, "  ACTIVATION_SKIP flag set for LV %s, skipping activation.\n", pos[0])
+			break
+		}
+		lv.Inactive = false
+	case "n":
+		lv.Inactive = true
+	}
 	return 0
 }
 

@@ -1,13 +1,19 @@
 package lvmd
 
 import (
+	"bufio"
 	"context"
 	"errors"
+	"fmt"
+	"os"
 	"os/exec"
 	"path"
+	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/go-logr/logr/testr"
 	"github.com/topolvm/topolvm/internal/lvmd/command"
@@ -446,8 +452,10 @@ func TestLVService_IncompleteSnapshotsOnRealLVM(t *testing.T) {
 		t.Fatalf("lvs: %v: %s", err, out)
 	}
 	fields := strings.Fields(string(out))
-	if len(fields) != 3 || fields[1][1] != 'r' || fields[2] != "snaptag" {
-		t.Errorf("snapshot after the rename: %q, want read-only with its tag", out)
+	// As before the build was made inactive: active, read-only, without the
+	// activation-skip flag, with its tag.
+	if len(fields) != 3 || len(fields[1]) < 10 || fields[1][1] != 'r' || fields[1][4] != 'a' || fields[1][9] == 'k' || fields[2] != "snaptag" {
+		t.Errorf("snapshot after the rename: %q, want active, read-only and with its tag", out)
 	}
 
 	if _, err := lvService.CreateLVSnapshot(ctx, &proto.CreateLVSnapshotRequest{
@@ -486,4 +494,238 @@ func TestLVService_IncompleteSnapshotsOnRealLVM(t *testing.T) {
 			t.Errorf("an LV is left under a build name: %s", name)
 		}
 	}
+}
+
+func lvAttr(t *testing.T, vgName, name string) string {
+	t.Helper()
+	out, err := exec.Command("lvs", "--noheadings", "-o", "lv_attr", vgName+"/"+name).CombinedOutput()
+	if err != nil {
+		t.Fatalf("lvs %s: %v: %s", name, err, out)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+func lvNames(t *testing.T, vgName string) []string {
+	t.Helper()
+	out, err := exec.Command("lvs", "--noheadings", "-o", "lv_name", vgName).CombinedOutput()
+	if err != nil {
+		t.Fatalf("lvs: %v: %s", err, out)
+	}
+	return strings.Fields(string(out))
+}
+
+// TestLVService_RenameOntoExistingNameOnRealLVM checks, on real LVM, that when
+// the requested name appears while a clone is built, lvrename refuses it, both
+// LVs stay intact, and the call removes only its own build.
+func TestLVService_RenameOntoExistingNameOnRealLVM(t *testing.T) {
+	ctx := ctrl.LoggerInto(context.Background(), testr.New(t))
+	lvService, _, vg, _ := setupLVService(ctx, t)
+	if _, err := lvService.CreateLV(ctx, &proto.CreateLVRequest{
+		Name: "source", DeviceClass: lvServiceTestThinDC, SizeBytes: 1 << 30,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	beforeSnapshotRename = func(ctx context.Context, vgName, name string) {
+		out, err := exec.Command("lvcreate", "-T", vgName+"/test_pool", "-V", "1g", "-n", name, "--addtag", "other").CombinedOutput()
+		if err != nil {
+			t.Errorf("lvcreate %s: %v: %s", name, err, out)
+		}
+	}
+	t.Cleanup(func() { beforeSnapshotRename = nil })
+
+	_, err := lvService.CreateLVSnapshot(ctx, &proto.CreateLVSnapshotRequest{
+		Name: "clone", DeviceClass: lvServiceTestThinDC, SourceVolume: "source",
+		SizeBytes: 2 << 30, AccessType: "rw",
+	})
+	if err == nil {
+		t.Fatal("the clone succeeded although its name was taken")
+	}
+	t.Logf("CreateLVSnapshot: %v", err)
+	out, err := exec.Command("lvs", "--noheadings", "-o", "lv_name,lv_size,lv_tags", "--units", "b", "--nosuffix", vg.Name()+"/clone").CombinedOutput()
+	if err != nil {
+		t.Fatalf("the LV that took the name is gone: %v: %s", err, out)
+	}
+	if fields := strings.Fields(string(out)); len(fields) != 3 || fields[1] != "1073741824" || fields[2] != "other" {
+		t.Errorf("the LV that took the name changed: %q", out)
+	}
+	names := lvNames(t, vg.Name())
+	if !slices.Contains(names, "source") {
+		t.Error("the source was removed")
+	}
+	for _, name := range names {
+		if incompleteSnapshotNamePattern.MatchString(name) {
+			t.Errorf("the build was left: %s", name)
+		}
+	}
+}
+
+// TestLVService_WritableCloneOnRealLVM checks, on real LVM, that a writable
+// clone, extended and renamed, is active and writable under its name, without
+// the activation-skip flag, with its device node in place and the build's gone
+// when CreateLVSnapshot returns.
+func TestLVService_WritableCloneOnRealLVM(t *testing.T) {
+	ctx := ctrl.LoggerInto(context.Background(), testr.New(t))
+	lvService, _, vg, _ := setupLVService(ctx, t)
+	if _, err := lvService.CreateLV(ctx, &proto.CreateLVRequest{
+		Name: "source", DeviceClass: lvServiceTestThinDC, SizeBytes: 1 << 30,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	res, err := lvService.CreateLVSnapshot(ctx, &proto.CreateLVSnapshotRequest{
+		Name: "clone", DeviceClass: lvServiceTestThinDC, SourceVolume: "source",
+		SizeBytes: 2 << 30, AccessType: "rw",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.GetSnapshot().GetSizeBytes() != 2<<30 {
+		t.Errorf("the clone is %d bytes, want 2 GiB", res.GetSnapshot().GetSizeBytes())
+	}
+	if _, err := os.Stat(path.Join("/dev", vg.Name(), "clone")); err != nil {
+		t.Errorf("no device node under the clone's name when the call returned: %v", err)
+	}
+	builds, err := filepath.Glob(path.Join("/dev", vg.Name(), "*"+incompleteSnapshotSuffix+"*"))
+	if err != nil || len(builds) != 0 {
+		t.Errorf("device nodes left under a build name: %v %v", builds, err)
+	}
+	attr := lvAttr(t, vg.Name(), "clone")
+	t.Logf("lv_attr of the clone: %s", attr)
+	if len(attr) < 10 || attr[1] != 'w' || attr[4] != 'a' || attr[9] == 'k' {
+		t.Errorf("lv_attr %q: want writable, active and without activation skip", attr)
+	}
+	for _, name := range lvNames(t, vg.Name()) {
+		if incompleteSnapshotNamePattern.MatchString(name) {
+			t.Errorf("the build was left: %s", name)
+		}
+	}
+}
+
+// suspension is one device-mapper suspend or resume that lvm logged.
+type suspension struct {
+	at   time.Duration
+	what string
+	dev  string
+}
+
+var suspendLine = regexp.MustCompile(`(Suspending|Resuming) (\S+) \((\d+:\d+)\)`)
+
+// lvmVerbose runs an lvm command with -vvvv and returns the device-mapper
+// suspends and resumes it logged, timed from its start.
+func lvmVerbose(t *testing.T, args ...string) []suspension {
+	t.Helper()
+	cmd := exec.Command(args[0], append([]string{"-vvvv"}, args[1:]...)...)
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	var events []suspension
+	scanner := bufio.NewScanner(stderr)
+	scanner.Buffer(make([]byte, 64<<10), 1<<20)
+	for scanner.Scan() {
+		if m := suspendLine.FindStringSubmatch(scanner.Text()); m != nil {
+			events = append(events, suspension{at: time.Since(start), what: m[1], dev: m[2] + " (" + m[3] + ")"})
+		}
+	}
+	if err := cmd.Wait(); err != nil {
+		t.Fatalf("%s: %v", strings.Join(args, " "), err)
+	}
+	return events
+}
+
+// describeSuspensions says which devices were suspended, and for how long.
+func describeSuspensions(events []suspension) string {
+	var b strings.Builder
+	since := map[string]time.Duration{}
+	for _, e := range events {
+		switch e.what {
+		case "Suspending":
+			since[e.dev] = e.at
+		case "Resuming":
+			if at, ok := since[e.dev]; ok {
+				fmt.Fprintf(&b, "%s suspended %.1f ms; ", e.dev, float64((e.at-at).Microseconds())/1000)
+				delete(since, e.dev)
+			}
+		}
+	}
+	for dev := range since {
+		fmt.Fprintf(&b, "%s suspended, resume not seen; ", dev)
+	}
+	if b.Len() == 0 {
+		return "nothing suspended"
+	}
+	return b.String()
+}
+
+func suspended(events []suspension) []string {
+	var devs []string
+	for _, e := range events {
+		if e.what == "Suspending" {
+			devs = append(devs, e.dev)
+		}
+	}
+	return devs
+}
+
+// TestLVService_SnapshotStepsSuspendScopeOnRealLVM runs the steps of a
+// writable clone larger than its source, and of a read-only snapshot, with
+// the lvm commands lvmd runs, on real LVM, next to another active thin volume,
+// and reports which device-mapper devices each step suspended: once in the
+// order lvmd uses, with the build inactive until it has its name, and once
+// with the build active from its creation, as before. It fails only if, in
+// lvmd's order, the rename suspends anything, or a step misbehaves.
+func TestLVService_SnapshotStepsSuspendScopeOnRealLVM(t *testing.T) {
+	ctx := ctrl.LoggerInto(context.Background(), testr.New(t))
+	lvService, _, vg, _ := setupLVService(ctx, t)
+	for _, name := range []string{"source", "neighbour"} {
+		if _, err := lvService.CreateLV(ctx, &proto.CreateLVRequest{
+			Name: name, DeviceClass: lvServiceTestThinDC, SizeBytes: 1 << 30,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	v := vg.Name()
+	var report strings.Builder
+	step := func(order, what string, args ...string) []suspension {
+		events := lvmVerbose(t, args...)
+		fmt.Fprintf(&report, "  %-8s %-36s %s\n", order, what, describeSuspensions(events))
+		return events
+	}
+
+	// lvmd's order: lvcreate -s -k n -a n, lvresize, lvchange -p r, lvrename,
+	// lvchange -k n -a y.
+	for _, c := range []struct{ name, access string }{{"clone", "rw"}, {"snap", "ro"}} {
+		build := c.name + incompleteSnapshotSuffix + "0123456789abcdef"
+		step("inactive", c.name+": lvcreate -s -a n", "lvcreate", "-s", "-k", "n", "-a", "n", "-n", build, v+"/source")
+		if c.access == "rw" {
+			step("inactive", c.name+": lvresize", "lvresize", "-L", fmt.Sprintf("%db", 2<<30), v+"/"+build)
+		} else {
+			step("inactive", c.name+": lvchange -p r", "lvchange", "-p", "r", v+"/"+build)
+		}
+		if devs := suspended(step("inactive", c.name+": lvrename", "lvrename", v, build, c.name)); len(devs) != 0 {
+			t.Errorf("renaming the inactive %s suspended %v", c.name, devs)
+		}
+		step("inactive", c.name+": lvchange -k n -a y", "lvchange", "-k", "n", "-a", "y", v+"/"+c.name)
+		attr := lvAttr(t, v, c.name)
+		if len(attr) < 10 || attr[4] != 'a' || attr[9] == 'k' || (c.access == "ro") != (attr[1] == 'r') {
+			t.Errorf("%s ends as %q", c.name, attr)
+		}
+	}
+
+	// The previous order: the build is active from lvcreate -s -k n on.
+	for _, c := range []struct{ name, access string }{{"old-clone", "rw"}, {"old-snap", "ro"}} {
+		build := c.name + incompleteSnapshotSuffix + "0123456789abcdef"
+		step("active", c.name+": lvcreate -s", "lvcreate", "-s", "-k", "n", "-n", build, v+"/source")
+		if c.access == "rw" {
+			step("active", c.name+": lvresize", "lvresize", "-L", fmt.Sprintf("%db", 2<<30), v+"/"+build)
+		} else {
+			step("active", c.name+": lvchange -p r", "lvchange", "-p", "r", v+"/"+build)
+		}
+		step("active", c.name+": lvrename", "lvrename", v, build, c.name)
+	}
+	t.Logf("device-mapper suspends per step, next to another active thin volume:\n%s", report.String())
 }

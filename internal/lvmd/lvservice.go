@@ -19,6 +19,10 @@ import (
 // runs even when the call that created it has been cancelled.
 var snapshotCleanupTimeout = 2 * time.Minute
 
+// beforeSnapshotRename, when set, runs just before CreateLVSnapshot gives a
+// complete build its requested name. Only tests set it, to change LVM there.
+var beforeSnapshotRename func(ctx context.Context, vgName, name string)
+
 // incompleteSnapshotCleanupFailures counts incomplete snapshots that could not
 // be removed after a failed CreateLVSnapshot.
 var incompleteSnapshotCleanupFailures = prometheus.NewCounter(prometheus.CounterOpts{
@@ -211,6 +215,9 @@ func (s *lvService) CreateLVSnapshot(ctx context.Context, req *proto.CreateLVSna
 	default:
 		return nil, status.Errorf(codes.InvalidArgument, "invalid device class type %v", string(dc.Type))
 	}
+	if req.AccessType != "ro" && req.AccessType != "rw" {
+		return nil, status.Errorf(codes.InvalidArgument, "unknown access type %q", req.AccessType)
+	}
 
 	capacityCheck := s.reservations.begin(reservationKey(dc))
 	defer capacityCheck.close()
@@ -269,6 +276,22 @@ func (s *lvService) CreateLVSnapshot(ctx context.Context, req *proto.CreateLVSna
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to list volumes: %v", err)
 	}
+
+	// A volume of this name may exist already. One that this lvmd built is
+	// complete once it has the name, because the rename comes after every
+	// other change (see below). If it is inactive, the call that built it
+	// stopped before the last step, the activation: finish that, which is
+	// safe to repeat. Anything else of this name is not ours to touch: report
+	// it, as CreateLV does.
+	if existing, err := vg.FindVolume(ctx, req.GetName()); err == nil {
+		if existing.IsThin() && existing.IsInactive() && existing.PoolName() == dc.ThinPoolConfig.Name {
+			return s.activateSnapshot(ctx, vg, existing)
+		}
+		return nil, status.Errorf(codes.AlreadyExists, "logical volume %s already exists", req.GetName())
+	} else if !errors.Is(err, command.ErrNotFound) {
+		return nil, status.Errorf(codes.Internal, "failed to look up volume: %v", err)
+	}
+
 	// The snapshot is built under a name of its own and renamed to the
 	// requested name only once it is complete (see below). Reports taken
 	// meanwhile show it under that name, so the reservation uses it too.
@@ -295,35 +318,54 @@ func (s *lvService) CreateLVSnapshot(ctx context.Context, req *proto.CreateLVSna
 		"snapType", snapType,
 		"accessType", req.AccessType,
 	)
-	// Create snapshot lv
-
-	// A volume of this name that existed before this call is not ours to
-	// remove: report it, as CreateLV does.
-	if _, err := vg.FindVolume(ctx, req.GetName()); err == nil {
-		return nil, status.Errorf(codes.AlreadyExists, "logical volume %s already exists", req.GetName())
-	} else if !errors.Is(err, command.ErrNotFound) {
-		return nil, status.Errorf(codes.Internal, "failed to look up volume: %v", err)
-	}
-
-	// The snapshot is created, read back, resized and activated under a name
-	// that only this call uses, and given the requested name by lvrename as
-	// the last step. lvrename refuses a name that exists, under the volume
-	// group's lock. So the requested name only ever appears on a complete
-	// snapshot, which a look-up may adopt, and a failed call removes only the
-	// LV it built itself, never one of the requested name that another call
-	// for the same volume created (for example the call of a restarted
-	// topolvm-node while the cancelled call's lvm still runs).
+	// The snapshot is created inactive, read back, resized and made read-only
+	// if asked under a name that only this call uses, then given the requested
+	// name by lvrename, and activated under it as the last step. lvrename
+	// refuses a name that exists, under the volume group's lock. So the
+	// requested name only ever appears on a complete snapshot, and a failed
+	// call removes only the LV it built itself, never one of the requested
+	// name that another call for the same volume created (for example the
+	// call of a restarted topolvm-node while the cancelled call's lvm still
+	// runs). Building it inactive keeps the thin pool running: on an inactive
+	// LV, lvresize, lvchange -p and lvrename change metadata only, whereas on
+	// an active thin LV each of them suspends the LV and its whole thin pool.
+	// Taking the snapshot suspends only its origin, and the activation adds
+	// one device.
 	//
-	// If any step from lvcreate -s on fails, remove that LV, so that an
-	// incomplete snapshot (at the wrong size, or writable when it should be
-	// read-only) is never left behind; the caller records the failure and
-	// retries from scratch. This includes lvcreate -s itself: when the call is
+	// A snapshot that has its name but is inactive is complete: its call
+	// stopped between the rename and the activation. A look-up does not adopt
+	// it; the next call for it activates it (see above).
+	//
+	// If any step from lvcreate -s up to the rename fails, remove the build,
+	// so that an incomplete snapshot (at the wrong size, or writable when it
+	// should be read-only) is never left behind; the caller records the
+	// failure and retries from scratch. This includes lvcreate -s itself: when the call is
 	// cancelled while it runs, the lvm process can still create the LV after
 	// lvmd stops waiting. The removal runs under a context of its own, because
 	// a cancelled call is the common reason to clean up. An LV left behind by
 	// an lvmd that was killed in between keeps its build name, which no
 	// LogicalVolume refers to, and is removed when lvmd starts again.
-	fail := func(msg string, err error) (*proto.CreateLVSnapshotResponse, error) {
+	snapLV, err := buildSnapshot(ctx, vg, sourceLV, buildName, desiredSize, req)
+	if err != nil {
+		return nil, err
+	}
+
+	logger.Info(
+		"created a new snapshot LV",
+		"size", desiredSize,
+		"accessType", req.AccessType,
+		"sourceID", sourceVolume,
+	)
+	return s.activateSnapshot(ctx, vg, snapLV)
+}
+
+// buildSnapshot creates the snapshot inactive under buildName, resizes it,
+// makes it read-only if asked, and renames it to the requested name. If a
+// step fails, it removes the build.
+func buildSnapshot(ctx context.Context, vg *command.VolumeGroup, sourceLV *command.LogicalVolume,
+	buildName string, desiredSize uint64, req *proto.CreateLVSnapshotRequest) (*command.LogicalVolume, error) {
+	logger := log.FromContext(ctx).WithValues("name", req.GetName())
+	fail := func(msg string, err error) (*command.LogicalVolume, error) {
 		logger.Error(err, msg, "buildName", buildName)
 		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), snapshotCleanupTimeout)
 		defer cancel()
@@ -355,32 +397,44 @@ func (s *lvService) CreateLVSnapshot(ctx context.Context, req *proto.CreateLVSna
 		return fail("failed to resize snapshot volume", err)
 	}
 
-	// If source volume is thin, activate the thin snapshot lv with accessmode.
-	if err := snapLV.Activate(ctx, req.AccessType); err != nil {
-		return fail("failed to activate snapshot volume", err)
+	if req.AccessType == "ro" {
+		if err := snapLV.SetReadOnly(ctx); err != nil {
+			return fail("failed to make snapshot volume read-only", err)
+		}
 	}
 
+	if beforeSnapshotRename != nil {
+		beforeSnapshotRename(ctx, vg.Name(), req.GetName())
+	}
 	if err := snapLV.Rename(ctx, req.GetName()); err != nil {
 		return fail("failed to give the snapshot volume its name", err)
 	}
+	return snapLV, nil
+}
 
+// activateSnapshot activates a complete snapshot under its name, the last step
+// of CreateLVSnapshot, and returns it. Nothing is removed if it fails: the
+// snapshot is complete, and the next call for it activates it.
+func (s *lvService) activateSnapshot(ctx context.Context, vg *command.VolumeGroup, lv *command.LogicalVolume) (*proto.CreateLVSnapshotResponse, error) {
+	logger := log.FromContext(ctx).WithValues("name", lv.Name())
+	if err := lv.Activate(ctx); err != nil {
+		logger.Error(err, "failed to activate snapshot volume; the next call for it activates it")
+		return nil, status.Errorf(codes.Internal, "failed to activate snapshot volume %s: %v", lv.Name(), err)
+	}
 	s.notify()
-
-	logger.Info(
-		"created a new snapshot LV",
-		"size", desiredSize,
-		"accessType", req.AccessType,
-		"sourceID", sourceVolume,
-	)
-
+	// Read it back for its device numbers, which it has only once active.
+	active, err := vg.LookupVolume(ctx, lv.Name())
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to look up snapshot volume %s after activating it: %v", lv.Name(), err)
+	}
 	return &proto.CreateLVSnapshotResponse{
 		Snapshot: &proto.LogicalVolume{
-			Name: snapLV.Name(),
+			Name: active.Name(),
 			// convert to int64 because lvmd internals and lvm use uint64 but CSI uses int64.
 			// For most conventional lvm use cases overflow here will never occur (9223372 TB or above cause overflow)
-			SizeBytes: int64(snapLV.Size()),
-			DevMajor:  snapLV.MajorNumber(),
-			DevMinor:  snapLV.MinorNumber(),
+			SizeBytes: int64(active.Size()),
+			DevMajor:  active.MajorNumber(),
+			DevMinor:  active.MinorNumber(),
 		},
 	}, nil
 }

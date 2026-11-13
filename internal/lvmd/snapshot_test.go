@@ -53,8 +53,10 @@ func TestCreateLVSnapshotCleansUpAfterFailure(t *testing.T) {
 		{"clone whose resize fails", "lvresize", "rw", 20 * fakeGiB},
 		// A snapshot is made read-only with lvchange.
 		{"snapshot whose lvchange fails", "lvchange", "ro", 10 * fakeGiB},
-		// A clone is activated with lvchange.
-		{"clone whose lvchange fails", "lvchange", "rw", 10 * fakeGiB},
+		// The build is read back with lvs.
+		{"clone whose read-back fails", "lvs", "rw", 10 * fakeGiB},
+		// The build is given its name with lvrename.
+		{"clone whose lvrename fails", "lvrename", "rw", 10 * fakeGiB},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := testContext(t)
@@ -233,10 +235,10 @@ func TestConcurrentSnapshotsAndClones(t *testing.T) {
 // the wrapper: the lvm command itself completes. No LV may be left behind,
 // and a retry must succeed.
 func TestCreateLVSnapshotCleansUpAfterCancellation(t *testing.T) {
-	for _, step := range []string{"lvcreate", "lvs", "lvresize", "lvchange"} {
+	for _, step := range []string{"lvcreate", "lvs", "lvresize"} {
 		t.Run("cancelled during "+step, func(t *testing.T) {
 			f := startFakeLVMD(t, fakelvm.Options{LikeNsenter: true})
-			// A clone larger than its source runs all four steps.
+			// A clone larger than its source runs every step.
 			req := &proto.CreateLVSnapshotRequest{
 				Name: "clone", DeviceClass: fakeThinDC, SourceVolume: "existing-thin",
 				SizeBytes: int64(20 * fakeGiB), AccessType: "rw",
@@ -385,7 +387,8 @@ func TestCreateLVSnapshotNameAppearsOnlyWhenComplete(t *testing.T) {
 	}()
 	f.lvm.WaitPaused(t)
 
-	// Everything but the rename is done; a look-up must not find the clone.
+	// Everything before the rename is done, on an inactive build; a look-up
+	// must not find the clone.
 	list, err := f.vg.GetLVList(testContext(t), &proto.GetLVListRequest{DeviceClass: fakeThinDC})
 	if err != nil {
 		t.Fatal(err)
@@ -393,6 +396,11 @@ func TestCreateLVSnapshotNameAppearsOnlyWhenComplete(t *testing.T) {
 	for _, v := range list.GetVolumes() {
 		if v.GetName() == "clone" {
 			t.Fatal("a look-up found the clone before it was complete")
+		}
+	}
+	for name, lv := range fakeLVNames(t, f) {
+		if incompleteSnapshotNamePattern.MatchString(name) && (!lv.Inactive || lv.Size != 20*fakeGiB) {
+			t.Errorf("the build before its rename: %+v, want inactive at 20 GiB", lv)
 		}
 	}
 
@@ -410,6 +418,121 @@ func TestCreateLVSnapshotNameAppearsOnlyWhenComplete(t *testing.T) {
 		t.Errorf("the clone is %d bytes, want 20 GiB", lv.Size)
 	}
 	expectNoIncompleteSnapshots(t, f)
+
+	// It has its name but was never activated: the next call activates it.
+	if !lv.Inactive {
+		t.Fatal("the clone was activated although its call stopped at the rename")
+	}
+	res, err := f.lv.CreateLVSnapshot(testContext(t), req)
+	if err != nil {
+		t.Fatalf("the next call failed: %v", err)
+	}
+	if res.GetSnapshot().GetSizeBytes() != int64(20*fakeGiB) {
+		t.Errorf("the next call returned %d bytes", res.GetSnapshot().GetSizeBytes())
+	}
+	if lv := fakeLVNames(t, f)["clone"]; lv.Inactive || lv.ReadOnly {
+		t.Errorf("the clone after the next call: %+v, want active and writable", lv)
+	}
+}
+
+// TestCreateLVSnapshotStopsBetweenRenameAndActivation stops a call after the
+// rename, as a failed activation or a crash of lvmd would: the snapshot is
+// complete under its name, so it is kept, not adopted as it is by a look-up,
+// and activated by the next call, at its size and permission, without
+// building anything again.
+func TestCreateLVSnapshotStopsBetweenRenameAndActivation(t *testing.T) {
+	t.Run("failed activation of a clone", func(t *testing.T) {
+		ctx := testContext(t)
+		f := startFakeLVMD(t, fakelvm.Options{})
+		req := &proto.CreateLVSnapshotRequest{
+			Name: "clone", DeviceClass: fakeThinDC, SourceVolume: "existing-thin",
+			SizeBytes: int64(20 * fakeGiB), AccessType: "rw",
+		}
+		// A writable clone's only lvchange is its activation.
+		f.lvm.Fail(t, "lvchange")
+		if _, err := f.lv.CreateLVSnapshot(ctx, req); status.Code(err) != codes.Internal {
+			t.Fatalf("got %v, want an Internal error", err)
+		}
+		lv, ok := fakeLVNames(t, f)["clone"]
+		if !ok || !lv.Inactive || lv.Size != 20*fakeGiB {
+			t.Fatalf("after the failed activation: %+v, want the complete clone, inactive", lv)
+		}
+		expectNoIncompleteSnapshots(t, f)
+		list, err := f.vg.GetLVList(ctx, &proto.GetLVListRequest{DeviceClass: fakeThinDC})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, v := range list.GetVolumes() {
+			if v.GetName() == "clone" && (len(v.GetAttr()) < 5 || v.GetAttr()[4] != '-') {
+				t.Errorf("a look-up shows the clone as %q, want inactive", v.GetAttr())
+			}
+		}
+
+		f.lvm.Fail(t)
+		f.lvm.Reset(t)
+		res, err := f.lv.CreateLVSnapshot(ctx, req)
+		if err != nil {
+			t.Fatalf("the next call failed: %v", err)
+		}
+		expectCommands(t, f, []string{"fullreport", "lvchange", "lvs"})
+		if res.GetSnapshot().GetSizeBytes() != int64(20*fakeGiB) || res.GetSnapshot().GetDevMajor() == 0 {
+			t.Errorf("the next call returned %v", res.GetSnapshot())
+		}
+		if lv := fakeLVNames(t, f)["clone"]; lv.Inactive || lv.ReadOnly || lv.SkipActivation {
+			t.Errorf("the clone after the next call: %+v, want active and writable", lv)
+		}
+	})
+
+	t.Run("crash before activating a read-only snapshot", func(t *testing.T) {
+		ctx := testContext(t)
+		f := fakelvm.Start(t, fakelvm.State{
+			VGs: []*fakelvm.VG{{
+				Name: fakeVGName, Size: 100 * fakeGiB, Free: 60 * fakeGiB,
+				LVs: []*fakelvm.LV{
+					{Name: fakePoolName, Size: 40 * fakeGiB, IsPool: true},
+					{Name: "existing-thin", Size: 10 * fakeGiB, Pool: fakePoolName, Minor: 100},
+					// Renamed, then lvmd was killed.
+					{Name: "snap", Size: 10 * fakeGiB, Pool: fakePoolName, Origin: "existing-thin", Minor: 101,
+						Inactive: true, ReadOnly: true, Tags: []string{"tag"}},
+				},
+			}},
+			NextMinor: 200,
+		}, fakelvm.Options{}, command.LVMCommandPrefix, command.SetLVMCommandPrefix)
+		lvs := NewLVService(NewDeviceClassManager([]*lvmdTypes.DeviceClass{{
+			Name: fakeThinDC, VolumeGroup: fakeVGName, Type: lvmdTypes.TypeThin,
+			ThinPoolConfig: &lvmdTypes.ThinPoolConfig{Name: fakePoolName, OverprovisionRatio: 2},
+		}}), NewLvcreateOptionClassManager(nil), func() {})
+		res, err := lvs.CreateLVSnapshot(ctx, &proto.CreateLVSnapshotRequest{
+			Name: "snap", DeviceClass: fakeThinDC, SourceVolume: "existing-thin", AccessType: "ro",
+		})
+		if err != nil {
+			t.Fatalf("the next call failed: %v", err)
+		}
+		if res.GetSnapshot().GetSizeBytes() != int64(10*fakeGiB) {
+			t.Errorf("the next call returned %v", res.GetSnapshot())
+		}
+		for _, vg := range f.State(t).VGs {
+			for _, lv := range vg.LVs {
+				if lv.Name == "snap" && (lv.Inactive || !lv.ReadOnly || len(lv.Tags) != 1) {
+					t.Errorf("the snapshot after the next call: %+v, want active, read-only, with its tag", lv)
+				}
+			}
+			if len(vg.LVs) != 3 {
+				t.Errorf("the next call built something: %d LVs", len(vg.LVs))
+			}
+		}
+	})
+
+	t.Run("an active volume of the name is not touched", func(t *testing.T) {
+		ctx := testContext(t)
+		f := startFakeLVMD(t, fakelvm.Options{})
+		_, err := f.lv.CreateLVSnapshot(ctx, &proto.CreateLVSnapshotRequest{
+			Name: "existing-thin", DeviceClass: fakeThinDC, SourceVolume: "existing-thin", AccessType: "rw",
+		})
+		if status.Code(err) != codes.AlreadyExists {
+			t.Errorf("got %v, want AlreadyExists", err)
+		}
+	})
 }
 
 // TestRemoveIncompleteSnapshots checks the sweep lvmd runs when it starts:

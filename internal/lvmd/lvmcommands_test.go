@@ -188,7 +188,9 @@ func TestLVMCommandsPerCall(t *testing.T) {
 					if err != nil {
 						t.Fatal(err)
 					}
-					expectCommands(t, f, []string{"fullreport", "lvcreate", "lvs", "lvchange", "lvrename"})
+					// Built inactive: lvchange -p r and lvrename change metadata,
+					// then lvchange -a y activates it and lvs reads its device.
+					expectCommands(t, f, []string{"fullreport", "lvcreate", "lvs", "lvchange", "lvrename", "lvchange", "lvs"})
 					if res.GetSnapshot().GetSizeBytes() != int64(10*fakeGiB) {
 						t.Errorf("unexpected snapshot: %v", res.GetSnapshot())
 					}
