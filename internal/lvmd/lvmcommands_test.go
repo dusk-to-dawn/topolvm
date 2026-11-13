@@ -180,7 +180,7 @@ func TestLVMCommandsPerCall(t *testing.T) {
 					if err != nil {
 						t.Fatal(err)
 					}
-					expectCommands(t, f, []string{"fullreport", "lvcreate", "lvs", "lvchange"})
+					expectCommands(t, f, []string{"fullreport", "lvcreate", "lvs", "lvchange", "lvrename"})
 					if res.GetSnapshot().GetSizeBytes() != int64(10*fakeGiB) {
 						t.Errorf("unexpected snapshot: %v", res.GetSnapshot())
 					}

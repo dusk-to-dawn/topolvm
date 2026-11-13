@@ -355,7 +355,7 @@ func Main(args []string) int {
 	// Like LVM's per-VG lock: reports share it, modifying commands hold it exclusively.
 	how := syscall.LOCK_SH
 	switch cmd {
-	case "lvcreate", "lvremove", "lvresize", "lvchange":
+	case "lvcreate", "lvremove", "lvresize", "lvchange", "lvrename":
 		how = syscall.LOCK_EX
 	}
 	if d, err := time.ParseDuration(os.Getenv(envWriteDelay)); how == syscall.LOCK_EX && err == nil && d > 0 {
@@ -400,6 +400,9 @@ func Main(args []string) int {
 		modified = code == 0
 	case "lvresize":
 		code = lvresize(state, opts, pos)
+		modified = code == 0
+	case "lvrename":
+		code = lvrename(state, pos)
 		modified = code == 0
 	case "lvchange":
 		code = 0
@@ -702,6 +705,34 @@ func lvremove(s *State, pos []string) int {
 		return 0
 	}
 	return lvNotFound(pos[0])
+}
+
+// lvrename renames an LV: lvrename <vg> <old> <new>. Like LVM, it refuses a
+// new name that exists.
+func lvrename(s *State, pos []string) int {
+	if len(pos) != 3 {
+		return exitUsage
+	}
+	vg := s.vg(pos[0])
+	if vg == nil {
+		return vgNotFound(pos[0])
+	}
+	if vg.lv(pos[2]) != nil {
+		fmt.Fprintf(os.Stderr, "  Logical Volume \"%s\" already exists in volume group \"%s\"\n", pos[2], pos[0])
+		return exitNotFound
+	}
+	lv := vg.lv(pos[1])
+	if lv == nil {
+		return lvNotFound(pos[0] + "/" + pos[1])
+	}
+	lv.Name = pos[2]
+	for _, other := range vg.LVs {
+		if other.Origin == pos[1] {
+			other.Origin = pos[2]
+		}
+	}
+	fmt.Printf("  Renamed \"%s\" to \"%s\" in volume group \"%s\"\n", pos[1], pos[2], pos[0])
+	return 0
 }
 
 func lvresize(s *State, opts map[string][]string, pos []string) int {

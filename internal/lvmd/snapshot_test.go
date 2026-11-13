@@ -2,12 +2,15 @@ package lvmd
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/topolvm/topolvm/internal/lvmd/command"
 	"github.com/topolvm/topolvm/internal/lvmd/testutils/fakelvm"
 	"github.com/topolvm/topolvm/pkg/lvmd/proto"
+	lvmdTypes "github.com/topolvm/topolvm/pkg/lvmd/types"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -21,6 +24,16 @@ func fakeLVNames(t *testing.T, f *fakeLVMD) map[string]*fakelvm.LV {
 		}
 	}
 	return names
+}
+
+// expectNoIncompleteSnapshots fails if an LV is left under a build name.
+func expectNoIncompleteSnapshots(t *testing.T, f *fakeLVMD) {
+	t.Helper()
+	for name := range fakeLVNames(t, f) {
+		if incompleteSnapshotNamePattern.MatchString(name) {
+			t.Errorf("an incomplete snapshot was left behind: %s", name)
+		}
+	}
 }
 
 // TestCreateLVSnapshotCleansUpAfterFailure checks that a snapshot or clone
@@ -55,6 +68,7 @@ func TestCreateLVSnapshotCleansUpAfterFailure(t *testing.T) {
 			if _, ok := fakeLVNames(t, f)["snap"]; ok {
 				t.Fatal("the incomplete snapshot LV was left behind")
 			}
+			expectNoIncompleteSnapshots(t, f)
 
 			f.lvm.Fail(t, "")
 			res, err := f.lv.CreateLVSnapshot(ctx, req)
@@ -137,6 +151,7 @@ func TestConcurrentSnapshotsAndClones(t *testing.T) {
 	if refused != 1 {
 		t.Errorf("%d refused, want 1", refused)
 	}
+	expectNoIncompleteSnapshots(t, f)
 	var virtual uint64
 	for _, lv := range names {
 		if lv.Pool == fakePoolName {
@@ -178,6 +193,7 @@ func TestCreateLVSnapshotCleansUpAfterCancellation(t *testing.T) {
 			if lv, ok := fakeLVNames(t, f)["clone"]; ok {
 				t.Fatalf("the incomplete clone was left behind: %+v", lv)
 			}
+			expectNoIncompleteSnapshots(t, f)
 
 			f.lvm.Pause(t, "")
 			res, err := f.lv.CreateLVSnapshot(testContext(t), req)
@@ -221,6 +237,7 @@ func TestCreateLVSnapshotOfGrowingSource(t *testing.T) {
 	if lv, ok := fakeLVNames(t, f)["snap"]; ok {
 		t.Fatalf("the oversized snapshot was left behind: %+v", lv)
 	}
+	expectNoIncompleteSnapshots(t, f)
 
 	f.lvm.Pause(t, "")
 	req.SizeBytes = int64(15 * fakeGiB)
@@ -230,5 +247,146 @@ func TestCreateLVSnapshotOfGrowingSource(t *testing.T) {
 	}
 	if res.GetSnapshot().GetSizeBytes() != int64(15*fakeGiB) {
 		t.Errorf("retry made a snapshot of %d bytes, want 15 GiB", res.GetSnapshot().GetSizeBytes())
+	}
+}
+
+// TestCreateLVSnapshotTwoCallsForOneName runs two calls for one clone, as after
+// a topolvm-node restart: the first waits in lvcreate -s while the second
+// creates the clone. The first must fail without removing the second's
+// clone, whether it was cancelled or not.
+func TestCreateLVSnapshotTwoCallsForOneName(t *testing.T) {
+	for _, cancelFirst := range []bool{false, true} {
+		t.Run(fmt.Sprintf("first call cancelled: %v", cancelFirst), func(t *testing.T) {
+			f := startFakeLVMD(t, fakelvm.Options{LikeNsenter: true})
+			req := &proto.CreateLVSnapshotRequest{
+				Name: "clone", DeviceClass: fakeThinDC, SourceVolume: "existing-thin",
+				SizeBytes: int64(20 * fakeGiB), AccessType: "rw",
+			}
+
+			f.lvm.Pause(t, "lvcreate")
+			ctx1, cancel1 := context.WithCancel(testContext(t))
+			defer cancel1()
+			first := make(chan error, 1)
+			go func() {
+				_, err := f.lv.CreateLVSnapshot(ctx1, req)
+				first <- err
+			}()
+			f.lvm.WaitPaused(t)
+
+			res, err := f.lv.CreateLVSnapshot(testContext(t), req)
+			if err != nil {
+				t.Fatalf("the second call failed: %v", err)
+			}
+			if res.GetSnapshot().GetName() != "clone" {
+				t.Errorf("the second call returned %q", res.GetSnapshot().GetName())
+			}
+
+			if cancelFirst {
+				cancel1()
+			}
+			f.lvm.Resume(t)
+			if err := <-first; err == nil {
+				t.Error("the first call succeeded although the clone exists")
+			}
+			lv, ok := fakeLVNames(t, f)["clone"]
+			if !ok {
+				t.Fatal("the first call removed the clone that the second call created")
+			}
+			if lv.Size != 20*fakeGiB {
+				t.Errorf("the clone is %d bytes, want 20 GiB", lv.Size)
+			}
+			expectNoIncompleteSnapshots(t, f)
+		})
+	}
+}
+
+// TestCreateLVSnapshotNameAppearsOnlyWhenComplete checks that a look-up never
+// sees the requested name on an unfinished clone, and that a clone whose
+// last step completed although the call was cancelled is kept.
+func TestCreateLVSnapshotNameAppearsOnlyWhenComplete(t *testing.T) {
+	f := startFakeLVMD(t, fakelvm.Options{LikeNsenter: true})
+	req := &proto.CreateLVSnapshotRequest{
+		Name: "clone", DeviceClass: fakeThinDC, SourceVolume: "existing-thin",
+		SizeBytes: int64(20 * fakeGiB), AccessType: "rw",
+	}
+
+	f.lvm.Pause(t, "lvrename")
+	ctx, cancel := context.WithCancel(testContext(t))
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, err := f.lv.CreateLVSnapshot(ctx, req)
+		done <- err
+	}()
+	f.lvm.WaitPaused(t)
+
+	// Everything but the rename is done; a look-up must not find the clone.
+	list, err := f.vg.GetLVList(testContext(t), &proto.GetLVListRequest{DeviceClass: fakeThinDC})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, v := range list.GetVolumes() {
+		if v.GetName() == "clone" {
+			t.Fatal("a look-up found the clone before it was complete")
+		}
+	}
+
+	// Cancelled during the rename, which lvm still completes.
+	cancel()
+	f.lvm.Resume(t)
+	if err := <-done; err == nil {
+		t.Fatal("the cancelled call succeeded")
+	}
+	lv, ok := fakeLVNames(t, f)["clone"]
+	if !ok {
+		t.Fatal("the complete clone was removed")
+	}
+	if lv.Size != 20*fakeGiB {
+		t.Errorf("the clone is %d bytes, want 20 GiB", lv.Size)
+	}
+	expectNoIncompleteSnapshots(t, f)
+}
+
+// TestRemoveIncompleteSnapshots checks the sweep lvmd runs when it starts:
+// only LVs under a build name are removed.
+func TestRemoveIncompleteSnapshots(t *testing.T) {
+	ctx := testContext(t)
+	f := fakelvm.Start(t, fakelvm.State{
+		VGs: []*fakelvm.VG{{
+			Name: fakeVGName,
+			Size: 100 * fakeGiB,
+			Free: 60 * fakeGiB,
+			LVs: []*fakelvm.LV{
+				{Name: fakePoolName, Size: 40 * fakeGiB, IsPool: true},
+				{Name: "existing-thin", Size: 10 * fakeGiB, Pool: fakePoolName, Minor: 100},
+				{Name: "clone" + incompleteSnapshotSuffix + "0123456789abcdef", Size: 10 * fakeGiB, Pool: fakePoolName, Origin: "existing-thin", Minor: 101},
+				{Name: "other" + incompleteSnapshotSuffix + "not-a-build-name", Size: 1 * fakeGiB, Pool: fakePoolName, Minor: 102},
+			},
+		}},
+		NextMinor: 200,
+	}, fakelvm.Options{}, command.LVMCommandPrefix, command.SetLVMCommandPrefix)
+
+	vgs, err := command.ListVolumeGroups(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	RemoveIncompleteSnapshots(ctx, vgs, []*lvmdTypes.DeviceClass{{
+		Name: fakeThinDC, VolumeGroup: fakeVGName, Type: lvmdTypes.TypeThin,
+		ThinPoolConfig: &lvmdTypes.ThinPoolConfig{Name: fakePoolName, OverprovisionRatio: 2},
+	}})
+
+	left := map[string]bool{}
+	for _, vg := range f.State(t).VGs {
+		for _, lv := range vg.LVs {
+			left[lv.Name] = true
+		}
+	}
+	for _, name := range []string{fakePoolName, "existing-thin", "other" + incompleteSnapshotSuffix + "not-a-build-name"} {
+		if !left[name] {
+			t.Errorf("%s was removed", name)
+		}
+	}
+	if left["clone"+incompleteSnapshotSuffix+"0123456789abcdef"] {
+		t.Error("the incomplete snapshot was not removed")
 	}
 }

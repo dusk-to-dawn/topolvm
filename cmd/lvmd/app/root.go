@@ -104,6 +104,10 @@ func subMain(parentCtx context.Context) error {
 		}
 	}
 
+	// Snapshots that an earlier lvmd left unfinished are removed before any
+	// call is served.
+	lvmd.RemoveIncompleteSnapshots(parentCtx, vgs, config.DeviceClasses)
+
 	// UNIX domain socket file should be removed before listening.
 	err = os.Remove(config.SocketName)
 	if err != nil && !os.IsNotExist(err) {

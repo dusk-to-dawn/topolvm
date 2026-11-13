@@ -19,6 +19,10 @@ call that started it is cancelled, only the `nsenter` wrapper is stopped: `lvm` 
 the host and lvmd frees the slot when it exits. If as many commands hang as there are slots, later
 calls wait for a slot and fail at their deadlines instead of starting more processes.
 
+Snapshots and clones are built under a temporary name, the volume's name followed by
+`.creating-` and 16 hexadecimal digits, and renamed to the volume's name as the last step.
+If lvmd stops before that, it removes such leftovers the next time it starts.
+
 ## Config File Format
 
 ```yaml

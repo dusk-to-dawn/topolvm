@@ -5,6 +5,8 @@ import (
 	"errors"
 	"os/exec"
 	"path"
+	"slices"
+	"strings"
 	"testing"
 
 	"github.com/go-logr/logr/testr"
@@ -413,5 +415,75 @@ func TestLVService_ThinSnapshots(t *testing.T) {
 	}
 	if lv.Tags()[1] != "testrestoretag2" {
 		t.Errorf(`testsnaptag1 not present on snapshot`)
+	}
+}
+
+// TestLVService_IncompleteSnapshotsOnRealLVM checks the snapshot naming with
+// real LVM: a snapshot is built under a name of its own and renamed, keeping
+// its size, permission and tags; a snapshot of an existing name is refused;
+// and the sweep lvmd runs when it starts removes only LVs under a build name.
+func TestLVService_IncompleteSnapshotsOnRealLVM(t *testing.T) {
+	ctx := ctrl.LoggerInto(context.Background(), testr.New(t))
+	lvService, _, vg, _ := setupLVService(ctx, t)
+
+	if _, err := lvService.CreateLV(ctx, &proto.CreateLVRequest{
+		Name: "source", DeviceClass: lvServiceTestThinDC, SizeBytes: 1 << 30,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	snap, err := lvService.CreateLVSnapshot(ctx, &proto.CreateLVSnapshotRequest{
+		Name: "snap", DeviceClass: lvServiceTestThinDC, SourceVolume: "source",
+		SizeBytes: 2 << 30, AccessType: "ro", Tags: []string{"snaptag"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snap.GetSnapshot().GetName() != "snap" || snap.GetSnapshot().GetSizeBytes() != 2<<30 {
+		t.Errorf("unexpected snapshot: %v", snap.GetSnapshot())
+	}
+	out, err := exec.Command("lvs", "--noheadings", "-o", "lv_name,lv_attr,lv_tags", vg.Name()+"/snap").CombinedOutput()
+	if err != nil {
+		t.Fatalf("lvs: %v: %s", err, out)
+	}
+	fields := strings.Fields(string(out))
+	if len(fields) != 3 || fields[1][1] != 'r' || fields[2] != "snaptag" {
+		t.Errorf("snapshot after the rename: %q, want read-only with its tag", out)
+	}
+
+	if _, err := lvService.CreateLVSnapshot(ctx, &proto.CreateLVSnapshotRequest{
+		Name: "snap", DeviceClass: lvServiceTestThinDC, SourceVolume: "source", AccessType: "ro",
+	}); status.Code(err) != codes.AlreadyExists {
+		t.Errorf("a snapshot of an existing name: got %v, want AlreadyExists", err)
+	}
+
+	leftover := "snap2" + incompleteSnapshotSuffix + "0123456789abcdef"
+	if out, err := exec.Command("lvcreate", "-s", "-k", "n", "-n", leftover, vg.Name()+"/source").CombinedOutput(); err != nil {
+		t.Fatalf("lvcreate: %v: %s", err, out)
+	}
+	vgs, err := command.ListVolumeGroups(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	RemoveIncompleteSnapshots(ctx, vgs, []*lvmdTypes.DeviceClass{{
+		Name: lvServiceTestThinDC, VolumeGroup: vg.Name(), Type: lvmdTypes.TypeThin,
+		ThinPoolConfig: &lvmdTypes.ThinPoolConfig{Name: "test_pool", OverprovisionRatio: 10},
+	}})
+	out, err = exec.Command("lvs", "--noheadings", "-o", "lv_name", vg.Name()).CombinedOutput()
+	if err != nil {
+		t.Fatalf("lvs: %v: %s", err, out)
+	}
+	names := strings.Fields(string(out))
+	if slices.Contains(names, leftover) {
+		t.Error("the sweep left the incomplete snapshot")
+	}
+	for _, name := range []string{"source", "snap"} {
+		if !slices.Contains(names, name) {
+			t.Errorf("the sweep removed %s", name)
+		}
+	}
+	for _, name := range names {
+		if incompleteSnapshotNamePattern.MatchString(name) {
+			t.Errorf("an LV is left under a build name: %s", name)
+		}
 	}
 }
