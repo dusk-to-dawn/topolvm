@@ -127,6 +127,14 @@ ref=${IMAGE##*:}
   for a in $NODE_ARGS; do echo "    - \"$a\""; done
   [ -z "$NODE_ARGS" ] && echo "    []"
   echo "controller:"
+  # The e2e values pin the single controller Pod to one node, and the chart's
+  # required anti-affinity keeps two controller Pods off one node, so a
+  # rolling update of the controller can never start its new Pod. Replace it
+  # instead when its image is changed below.
+  if [ -n "$CONTROLLER_IMAGE" ]; then
+    echo "  updateStrategy:"
+    echo "    type: Recreate"
+  fi
   echo "  csiProvisioner:"
   echo "    args:"
   for a in $PROVISIONER_ARGS; do echo "      - \"$a\""; done
@@ -148,7 +156,25 @@ if [ -n "$CONTROLLER_IMAGE" ]; then
   docker pull -q "$CONTROLLER_IMAGE" >/dev/null
   "$KIND" load docker-image --name topolvm-e2e "$CONTROLLER_IMAGE" >/dev/null
   "$KUBECTL" set image -n topolvm-system deployment/topolvm-controller "topolvm-controller=$CONTROLLER_IMAGE" >/dev/null
-  "$KUBECTL" rollout status -n topolvm-system deployment/topolvm-controller --timeout=180s >/dev/null
+  if ! "$KUBECTL" rollout status -n topolvm-system deployment/topolvm-controller --timeout=180s >/dev/null; then
+    log "topolvm-controller did not roll out"
+    "$KUBECTL" get pods -n topolvm-system -o wide >&2 || true
+    "$KUBECTL" describe pods -n topolvm-system -l app.kubernetes.io/component=controller 2>&1 | tail -n 60 >&2 || true
+    "$KUBECTL" get events -n topolvm-system --sort-by=.lastTimestamp 2>&1 | tail -n 30 >&2 || true
+    exit 1
+  fi
+  # The old Pod's leases (topolvm-controller's and the CSI sidecars') pass to
+  # the new one once they expire: wait for that, so that the first round does
+  # not measure it.
+  ctrl_pod=$("$KUBECTL" get pod -n topolvm-system -l app.kubernetes.io/component=controller \
+    --field-selector status.phase=Running -o jsonpath='{.items[0].metadata.name}')
+  for _ in $(seq 90); do
+    others=$("$KUBECTL" get lease -n topolvm-system -o jsonpath='{range .items[*]}{.spec.holderIdentity}{"\n"}{end}' \
+      | grep '^topolvm-controller-' | grep -vc "^$ctrl_pod" || true)
+    [ "$others" -eq 0 ] && break
+    sleep 1
+  done
+  "$KUBECTL" get lease -n topolvm-system -o custom-columns=NAME:.metadata.name,HOLDER:.spec.holderIdentity >&2 || true
 fi
 "$KUBECTL" wait --for=condition=ready --timeout=180s -n topolvm-system -l app.kubernetes.io/component=node pod >/dev/null
 "$KUBECTL" create namespace "$NS" >/dev/null
@@ -251,6 +277,11 @@ create_staggered() {
   wait $pids
 }
 
+# thin_lvs: the thin volumes in node 1's pool, snapshot builds included.
+thin_lvs() {
+  sudo lvs --noheadings -o lv_name -S 'pool_lv=pool0' node1-bench 2>/dev/null | awk 'NF'
+}
+
 # thin_sum: bytes of all thin volumes in node 1's pool, as LVM reports them.
 thin_sum() {
   sudo lvs --noheadings --units b --nosuffix -o lv_size -S 'pool_lv=pool0' node1-bench 2>/dev/null \
@@ -322,8 +353,10 @@ for mode in $MODES; do
       t_deleted=$(date -u +%s.%N)
       sleep 3
       sudo journalctl -u lvmd1.service -o cat --since "@${t_del%.*}" > "$rdir/lvmd-delete.log"
+      left_objects=$(lv_count)
+      left_lvs=$(thin_lvs | wc -l)
       cat > "$rdir/times.json" <<EOF
-{"round": "$round", "mode": "$mode", "size": $size, "t0": $t0, "t_created": $t_created, "t_bound": $t_bound, "t_del": $t_del, "t_deleted": $t_deleted}
+{"round": "$round", "mode": "$mode", "size": $size, "t0": $t0, "t_created": $t_created, "t_bound": $t_bound, "t_del": $t_del, "t_deleted": $t_deleted, "leftover_logicalvolumes": $left_objects, "leftover_lvs": $left_lvs}
 EOF
       python3 "$HERE/parse.py" "$rdir" | tee "$rdir/result.json" >&2
     done
@@ -396,6 +429,24 @@ sudo journalctl -u lvmd1.service -o cat --since "@${T_START}" > "$OUT/lvmd1-full
 } > "$OUT/adoptions.txt"
 cat "$OUT/adoptions.txt" >&2
 
+# The run fails on what must not happen, and only after everything above is
+# recorded: a claim of an ordinary round not provisioned or a provisioning
+# failure, an overcommit in the limit round, or anything left after deletion.
+# Adoptions, waits for the cache and error lines are reported, not judged.
+FAILURES=$(python3 "$HERE/verdict.py" "$OUT")
+LEFT_AT_END=$(thin_lvs | wc -l)
+if [ "$LEFT_AT_END" -gt 0 ]; then
+  FAILURES="$FAILURES
+left in the pool at the end: $(thin_lvs | tr '\n' ' ')"
+fi
+if [ "$LIMIT_FAILED" = 1 ]; then
+  FAILURES="$FAILURES
+the limit round overcommitted the pool"
+fi
+FAILURES=$(printf '%s\n' "$FAILURES" | awk 'NF')
+printf '%s\n' "${FAILURES:-none}" > "$OUT/failures.txt"
+log "failures: ${FAILURES:-none}"
+
 # Leave the runner as it was found, so that another configuration can run in
 # the same job.
 log "teardown"
@@ -409,6 +460,6 @@ for i in 1 2 3; do
   rm -f "$WORK/backing$i"
 done
 
-if [ "$LIMIT_FAILED" = 1 ]; then
+if [ -n "$FAILURES" ]; then
   exit 1
 fi

@@ -88,10 +88,27 @@ def main(rdir):
             failed += 1
 
     node_created = []
+    # What topolvm-node did beyond creating each volume once: adopting a volume
+    # that lvmd reported as existing (a second pass for a volume it had just
+    # created), waiting in vain for its cache, and logging at error level.
+    node_counts = {"adopted": 0, "cache_wait_timeouts": 0, "status_conflicts": 0, "error_lines": 0}
     for line in (rdir / "node.log").read_text().splitlines():
+        try:
+            t = ts(line.split(" ", 1)[0])
+        except ValueError:
+            continue
+        if t < t0:
+            continue
         if '"created new LV"' in line:
-            node_created.append(ts(line.split(" ", 1)[0]))
-    node_created = [t for t in node_created if t >= t0]
+            node_created.append(t)
+        if '"set volumeID to existing LogicalVolume"' in line:
+            node_counts["adopted"] += 1
+        if "the cache did not show the new volume ID in time" in line:
+            node_counts["cache_wait_timeouts"] += 1
+        if "the object has been modified" in line or "changed while its LV was created" in line:
+            node_counts["status_conflicts"] += 1
+        if '"level":"error"' in line:
+            node_counts["error_lines"] += 1
     lvmd_created = [t for t in lvmd_times(rdir / "lvmd.log", "created a new LV") if t >= t0]
 
     last_node = max(node_created) if node_created else None
@@ -136,6 +153,13 @@ def main(rdir):
         "last_lvmd_removed_s": round(max(removed) - times["t_del"], 3) if removed else None,
         "lvm_commands_delete_window": delete_cmds,
         "lvm_per_removal_excl_fullreport": per_volume(delete_cmds, len(removed), False),
+        "node_created": len(node_created),
+        "node_adopted": node_counts["adopted"],
+        "node_cache_wait_timeouts": node_counts["cache_wait_timeouts"],
+        "node_status_conflicts": node_counts["status_conflicts"],
+        "node_error_lines": node_counts["error_lines"],
+        "leftover_logicalvolumes": times.get("leftover_logicalvolumes"),
+        "leftover_lvs": times.get("leftover_lvs"),
     }
     print(json.dumps(result, sort_keys=False))
 

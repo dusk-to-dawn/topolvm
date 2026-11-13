@@ -18,6 +18,11 @@ COLUMNS = [
     ("fullreports_create_window", "watch fullreports"),
     ("delete_all_lvs_gone_s", "all LVs gone s"),
     ("lvm_per_removal_excl_fullreport", "lvm per removal"),
+    ("node_adopted", "node adopted"),
+    ("node_cache_wait_timeouts", "node cache waits timed out"),
+    ("node_status_conflicts", "node status conflicts"),
+    ("node_error_lines", "node error lines"),
+    ("leftover_lvs", "LVs left"),
 ]
 
 
@@ -44,6 +49,9 @@ def main(name, out):
               f"{r['stagger_ms']} ms apart; thin volumes reached at most {r['max_thin_bytes']} of "
               f"{r['limit_bytes']} bytes ({verdict}); {r['volumes_created']} volumes created; "
               f"{r['samples']} samples.")
+    failures = Path(out, "failures.txt")
+    if failures.exists():
+        print("\nFailures: " + "; ".join(failures.read_text().split("\n")).strip("; "))
     env = Path(out, "env.txt")
     if env.exists():
         print("\n```\n" + env.read_text() + "```\n")
