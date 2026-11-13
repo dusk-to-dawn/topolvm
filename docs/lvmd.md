@@ -101,6 +101,25 @@ reporting the free space of the volume group.
 
 The default spare capacity is 10 GiB.  This can be changed with `--spare` command-line flag.
 
+## Notes for Operators
+
+- **Run one lvmd per node.** This lvmd waits for any other lvmd of its socket to exit before it
+  starts (see above), but an older lvmd does not, and two lvmd processes on one volume group do not
+  see each other's changes in progress. While lvmd on a node is older than this one, or is being
+  replaced by an older one, run only one lvmd Pod on that node at a time: replace lvmd by changing
+  the image of its DaemonSet, without surge, rather than by starting a second DaemonSet next to it.
+- **The name shape `<name>.creating-<16 hexadecimal digits>` is lvmd's.** lvmd removes any LV named
+  so in the volume group of a thin device class, in any of its pools, when it starts and while it
+  runs. Do not give other LVs such names.
+- **Tools that look for orphaned LVs** should report LVs of that shape apart from other orphans: they
+  are snapshots and clones being built, or builds whose clean-up failed, which lvmd removes within
+  about ten minutes or when it starts again. One that survives a restart of lvmd is a bug. An
+  inactive LV that has a LogicalVolume's name is a snapshot or clone whose activation did not happen
+  yet; topolvm-node has lvmd activate it.
+- **A custom `lvm-command-prefix` must enter the host's IPC namespace**, as the default `nsenter`
+  prefix does with `-i`. LVM commands that create, activate or rename active devices wait for udev
+  on a semaphore in that namespace, and could wait for ever outside it.
+
 ## API Specification
 
 [See here.](./lvmd-protocol.md)
