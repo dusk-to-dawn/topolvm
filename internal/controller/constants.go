@@ -1,6 +1,16 @@
 package controller
 
+import "time"
+
 const (
+	// cacheCatchUpTimeout bounds how long a pass that patched its
+	// LogicalVolume waits for the cache to show the status it then wrote.
+	cacheCatchUpTimeout = time.Second
+
+	// conflictRequeueDelay is when a pass whose status update conflicted
+	// looks at the LogicalVolume again, if no event has brought it back first.
+	conflictRequeueDelay = 100 * time.Millisecond
+
 	// keySelectedNode is a PVC resource indexing key for the controller
 	keySelectedNode = "metadata.annotations.selected-node"
 

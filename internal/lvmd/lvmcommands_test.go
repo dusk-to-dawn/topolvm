@@ -155,6 +155,14 @@ func TestLVMCommandsPerCall(t *testing.T) {
 					t.Errorf("got %v, want AlreadyExists", err)
 				}
 				expectCommands(t, f, []string{"fullreport"})
+				// It is refused before any capacity is reserved, and leaves
+				// nothing in the bookkeeping.
+				r := f.lv.(*lvService).reservations
+				r.mu.Lock()
+				defer r.mu.Unlock()
+				if len(r.pools) != 0 {
+					t.Errorf("capacity bookkeeping left for %d pools", len(r.pools))
+				}
 			})
 
 			t.Run("ResizeLV", func(t *testing.T) {

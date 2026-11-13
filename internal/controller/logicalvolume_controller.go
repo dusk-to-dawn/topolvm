@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/go-logr/logr"
 	"github.com/topolvm/topolvm"
@@ -14,6 +15,7 @@ import (
 	apierrs "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/wait"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -71,6 +73,7 @@ func (r *LogicalVolumeReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	}
 
 	if lv.DeletionTimestamp == nil {
+		patched := false
 		if !controllerutil.ContainsFinalizer(lv, topolvm.GetLogicalVolumeFinalizer()) ||
 			!containsKeyAndValue(lv.Labels, topolvm.CreatedbyLabelKey, topolvm.CreatedbyLabelValue) {
 			// Add the finalizer and the label with one patch, and go on with the
@@ -87,14 +90,30 @@ func (r *LogicalVolumeReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 				return ctrl.Result{}, err
 			}
 			lv = lv2
+			patched = true
 		}
 
 		if lv.Status.VolumeID == "" {
 			err := r.createLV(ctx, log, lv)
-			if err != nil {
+			switch {
+			case apierrs.IsConflict(err):
+				// The object changed after it was read, most often by this
+				// reconciler's own status update that the cache did not show
+				// yet. The LV exists; the next pass adopts or skips it.
+				log.Info("LogicalVolume changed while its LV was created; reading it again", "name", lv.Name)
+				return ctrl.Result{RequeueAfter: conflictRequeueDelay}, nil
+			case err != nil:
 				log.Error(err, "failed to create LV", "name", lv.Name)
+				return ctrl.Result{}, err
 			}
-			return ctrl.Result{}, err
+			if patched {
+				// The patch queued this object again while lvmd worked, and
+				// that pass starts as soon as this one returns. Wait for the
+				// cache to show the volume ID, so that it does not see the
+				// object as it was and ask lvmd for the volume a second time.
+				r.waitForCachedVolumeID(ctx, log, lv)
+			}
+			return ctrl.Result{}, nil
 		}
 
 		err := r.expandLV(ctx, log, lv)
@@ -223,12 +242,30 @@ func (r *LogicalVolumeReconciler) createLV(ctx context.Context, log logr.Logger,
 	}
 
 	if err := r.client.Status().Update(ctx, lv); err != nil {
-		log.Error(err, "failed to update status", "name", lv.Name, "uid", lv.UID)
+		if !apierrs.IsConflict(err) {
+			log.Error(err, "failed to update status", "name", lv.Name, "uid", lv.UID)
+		}
 		return err
 	}
 
 	log.Info("created new LV", "name", lv.Name, "uid", lv.UID, "status.volumeID", lv.Status.VolumeID)
 	return nil
+}
+
+// waitForCachedVolumeID waits until the cache shows lv's volume ID, the
+// object is gone, or cacheCatchUpTimeout has passed.
+func (r *LogicalVolumeReconciler) waitForCachedVolumeID(ctx context.Context, log logr.Logger, lv *topolvmv1.LogicalVolume) {
+	key := client.ObjectKeyFromObject(lv)
+	err := wait.PollUntilContextTimeout(ctx, 5*time.Millisecond, cacheCatchUpTimeout, true, func(ctx context.Context) (bool, error) {
+		cached := new(topolvmv1.LogicalVolume)
+		if err := r.client.Get(ctx, key, cached); err != nil {
+			return apierrs.IsNotFound(err), nil
+		}
+		return cached.Status.VolumeID != "", nil
+	})
+	if err != nil {
+		log.Info("the cache did not show the new volume ID in time", "name", lv.Name, "timeout", cacheCatchUpTimeout)
+	}
 }
 
 // adoptLV records an existing LVM LV, found by its name, as the volume of lv.
@@ -293,7 +330,12 @@ func (r *LogicalVolumeReconciler) createLVOnce(ctx context.Context, log logr.Log
 		})
 		if err != nil {
 			code, message := extractFromError(err)
-			log.Error(err, message)
+			if code == codes.AlreadyExists {
+				// createLV looks the volume up, and adopts it or fails.
+				log.Info("LV already exists; looking it up", "name", lv.Name, "uid", lv.UID)
+			} else {
+				log.Error(err, message)
+			}
 			lv.Status.Code = code
 			lv.Status.Message = message
 			return err
