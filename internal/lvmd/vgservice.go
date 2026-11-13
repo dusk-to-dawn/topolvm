@@ -17,11 +17,19 @@ import (
 // watcher. Changes notified in the meantime are coalesced into the next one.
 var watchMinInterval = time.Second
 
+// leftoverSweepInterval is the shortest time between two sweeps of leftover
+// snapshot builds. A sweep uses the report taken for a watcher, so it runs on
+// the first report after the interval: lvmd sends one at least every ten
+// minutes.
+var leftoverSweepInterval = 5 * time.Minute
+
 // NewVGService creates a VGServiceServer
 func NewVGService(manager *DeviceClassManager) (proto.VGServiceServer, func()) {
 	svc := &vgService{
 		dcManager: manager,
 		watchers:  make(map[int]chan struct{}),
+		// lvmd sweeps when it starts.
+		lastSweep: time.Now(),
 	}
 
 	return svc, svc.notifyWatchers
@@ -35,6 +43,28 @@ type vgService struct {
 	mu             sync.Mutex
 	watcherCounter int
 	watchers       map[int]chan struct{}
+
+	// sweepMu protects lastSweep.
+	sweepMu   sync.Mutex
+	lastSweep time.Time
+}
+
+// sweepIfDue removes leftover snapshot builds, using vgs, if the last sweep
+// was at least leftoverSweepInterval ago.
+func (s *vgService) sweepIfDue(ctx context.Context, vgs []*command.VolumeGroup) {
+	s.sweepMu.Lock()
+	if time.Since(s.lastSweep) < leftoverSweepInterval {
+		s.sweepMu.Unlock()
+		return
+	}
+	s.lastSweep = time.Now()
+	s.sweepMu.Unlock()
+
+	deviceClasses := make([]*lvmdTypes.DeviceClass, 0, len(s.dcManager.deviceClassByName))
+	for _, dc := range s.dcManager.deviceClassByName {
+		deviceClasses = append(deviceClasses, dc)
+	}
+	RemoveLeftoverBuilds(ctx, vgs, deviceClasses)
 }
 
 func (s *vgService) GetLVList(ctx context.Context, req *proto.GetLVListRequest) (*proto.GetLVListResponse, error) {
@@ -185,7 +215,11 @@ func (s *vgService) send(server proto.VGService_WatchServer) error {
 			SizeBytes:   vgSize,
 		})
 	}
-	return server.Send(res)
+	if err := server.Send(res); err != nil {
+		return err
+	}
+	s.sweepIfDue(server.Context(), vgs)
+	return nil
 }
 
 func (s *vgService) addWatcher(ch chan struct{}) int {

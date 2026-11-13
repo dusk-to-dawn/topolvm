@@ -276,6 +276,10 @@ func (s *lvService) CreateLVSnapshot(ctx context.Context, req *proto.CreateLVSna
 	if err != nil {
 		return nil, status.Error(codes.Internal, err.Error())
 	}
+	// Registered before the LV can exist, and until after the clean-up, so
+	// that the sweep of leftover builds never takes it for one.
+	startBuild(buildName)
+	defer endBuild(buildName)
 	reserved, free := capacityCheck.reserve(free, buildName, desiredSize, reportedSizes(vols))
 	if reserved == nil {
 		logger.Error(err, "not enough space left on VG", "free", free, "desiredSize", desiredSize)

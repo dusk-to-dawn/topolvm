@@ -13,6 +13,7 @@ import (
 	"github.com/topolvm/topolvm/internal/lvmd/testutils/fakelvm"
 	"github.com/topolvm/topolvm/pkg/lvmd/proto"
 	lvmdTypes "github.com/topolvm/topolvm/pkg/lvmd/types"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -453,4 +454,91 @@ func TestRemoveIncompleteSnapshots(t *testing.T) {
 	if left["clone"+incompleteSnapshotSuffix+"0123456789abcdef"] {
 		t.Error("the incomplete snapshot was not removed")
 	}
+}
+
+// watchStub is the server side of a Watch stream that only records reports.
+type watchStub struct {
+	grpc.ServerStream
+	ctx  context.Context
+	sent int
+}
+
+func (w *watchStub) Context() context.Context { return w.ctx }
+
+func (w *watchStub) Send(*proto.WatchResponse) error {
+	w.sent++
+	return nil
+}
+
+// TestLeftoverBuildsAreSweptWhileLVMDRuns checks the periodic sweep: it
+// removes a build whose clean-up failed, using the report taken for a
+// watcher, and never a build that a call is still making.
+func TestLeftoverBuildsAreSweptWhileLVMDRuns(t *testing.T) {
+	interval := leftoverSweepInterval
+	leftoverSweepInterval = 0
+	t.Cleanup(func() { leftoverSweepInterval = interval })
+	ctx := testContext(t)
+	f := startFakeLVMD(t, fakelvm.Options{LikeNsenter: true})
+	vg := f.vg.(*vgService)
+	report := func() {
+		t.Helper()
+		if err := vg.send(&watchStub{ctx: ctx}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	leftovers := func() []string {
+		var names []string
+		for name := range fakeLVNames(t, f) {
+			if incompleteSnapshotNamePattern.MatchString(name) {
+				names = append(names, name)
+			}
+		}
+		return names
+	}
+
+	t.Log("a build whose clean-up failed is left, then swept")
+	f.lvm.Fail(t, "lvchange", "lvremove")
+	if _, err := f.lv.CreateLVSnapshot(ctx, &proto.CreateLVSnapshotRequest{
+		Name: "snap", DeviceClass: fakeThinDC, SourceVolume: "existing-thin", AccessType: "ro",
+	}); err == nil {
+		t.Fatal("the snapshot succeeded although lvchange fails")
+	}
+	f.lvm.Fail(t)
+	if left := leftovers(); len(left) != 1 {
+		t.Fatalf("left %v, want one build", left)
+	}
+	f.lvm.Reset(t)
+	report()
+	if left := leftovers(); len(left) != 0 {
+		t.Errorf("the sweep left %v", left)
+	}
+	// The sweep used the watcher's report: lvremove is its only command.
+	expectCommands(t, f, []string{"fullreport", "lvremove"})
+
+	t.Log("a build in progress is not swept")
+	f.lvm.Pause(t, "lvrename")
+	done := make(chan error, 1)
+	go func() {
+		_, err := f.lv.CreateLVSnapshot(ctx, &proto.CreateLVSnapshotRequest{
+			Name: "clone", DeviceClass: fakeThinDC, SourceVolume: "existing-thin",
+			SizeBytes: int64(20 * fakeGiB), AccessType: "rw",
+		})
+		done <- err
+	}()
+	f.lvm.WaitPaused(t)
+	if left := leftovers(); len(left) != 1 {
+		t.Fatalf("building %v, want one build", left)
+	}
+	report()
+	if left := leftovers(); len(left) != 1 {
+		t.Error("the sweep removed a build in progress")
+	}
+	f.lvm.Resume(t)
+	if err := <-done; err != nil {
+		t.Fatalf("the clone failed: %v", err)
+	}
+	if lv, ok := fakeLVNames(t, f)["clone"]; !ok || lv.Size != 20*fakeGiB {
+		t.Errorf("the clone is missing or incomplete: %v", lv)
+	}
+	expectNoIncompleteSnapshots(t, f)
 }

@@ -4,8 +4,10 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"regexp"
+	"sync"
 
 	"github.com/topolvm/topolvm/internal/lvmd/command"
 	lvmdTypes "github.com/topolvm/topolvm/pkg/lvmd/types"
@@ -28,6 +30,33 @@ func incompleteSnapshotName(name string) (string, error) {
 	return name + incompleteSnapshotSuffix + hex.EncodeToString(b[:]), nil
 }
 
+// builds holds the build names of the snapshots and clones this lvmd is
+// making. CreateLVSnapshot adds a name before lvcreate -s can create the LV,
+// and removes it when the call has returned, after its own clean-up.
+var builds = struct {
+	sync.Mutex
+	names map[string]struct{}
+}{names: map[string]struct{}{}}
+
+func startBuild(name string) {
+	builds.Lock()
+	defer builds.Unlock()
+	builds.names[name] = struct{}{}
+}
+
+func endBuild(name string) {
+	builds.Lock()
+	defer builds.Unlock()
+	delete(builds.names, name)
+}
+
+func building(name string) bool {
+	builds.Lock()
+	defer builds.Unlock()
+	_, ok := builds.names[name]
+	return ok
+}
+
 // RemoveIncompleteSnapshots removes the snapshots and clones that an earlier
 // lvmd left unfinished in the volume groups of the thin device classes: LVs
 // still under the build name of CreateLVSnapshot. No LogicalVolume refers to
@@ -35,6 +64,20 @@ func incompleteSnapshotName(name string) (string, error) {
 // its last step. Call it when lvmd starts, before it serves any call; vgs is
 // the volume groups as ListVolumeGroups reports them.
 func RemoveIncompleteSnapshots(ctx context.Context, vgs []*command.VolumeGroup, deviceClasses []*lvmdTypes.DeviceClass) {
+	removeBuilds(ctx, vgs, deviceClasses, "removed incomplete snapshot volume left by an earlier lvmd")
+}
+
+// RemoveLeftoverBuilds removes, while lvmd runs, the LVs under a build name
+// that no call of this lvmd is making: builds whose clean-up failed, and
+// builds that the lvm process of a cancelled call created after the call had
+// cleaned up. vgs is a report taken at any time before: a build that was in
+// progress then and has finished since is gone or renamed, and a build that
+// started since cannot be in it.
+func RemoveLeftoverBuilds(ctx context.Context, vgs []*command.VolumeGroup, deviceClasses []*lvmdTypes.DeviceClass) {
+	removeBuilds(ctx, vgs, deviceClasses, "removed leftover snapshot build volume")
+}
+
+func removeBuilds(ctx context.Context, vgs []*command.VolumeGroup, deviceClasses []*lvmdTypes.DeviceClass, removed string) {
 	logger := log.FromContext(ctx)
 	done := map[string]bool{}
 	for _, dc := range deviceClasses {
@@ -52,14 +95,18 @@ func RemoveIncompleteSnapshots(ctx context.Context, vgs []*command.VolumeGroup, 
 			continue
 		}
 		for name := range lvs {
-			if !incompleteSnapshotNamePattern.MatchString(name) {
+			if !incompleteSnapshotNamePattern.MatchString(name) || building(name) {
 				continue
 			}
-			if err := command.RemoveVolume(ctx, vg.Name(), name); err != nil {
+			err := command.RemoveVolume(ctx, vg.Name(), name)
+			switch {
+			case errors.Is(err, command.ErrNotFound):
+				// Renamed or removed by its call since the report.
+			case err != nil:
 				logger.Error(err, "failed to remove incomplete snapshot volume", "volume_group", dc.VolumeGroup, "name", name)
-				continue
+			default:
+				logger.Info(removed, "volume_group", dc.VolumeGroup, "name", name)
 			}
-			logger.Info("removed incomplete snapshot volume left by an earlier lvmd", "volume_group", dc.VolumeGroup, "name", name)
 		}
 	}
 }

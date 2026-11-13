@@ -31,7 +31,10 @@ Pod on a node at a time.
 
 Snapshots and clones are built under a temporary name, the volume's name followed by
 `.creating-` and 16 hexadecimal digits, and renamed to the volume's name as the last step.
-If lvmd stops before that, it removes such leftovers the next time it starts.
+If lvmd stops before that, it removes such leftovers the next time it starts. While it runs, it
+also removes, at most every 5 minutes and from the report it takes for topolvm-node's watch, any
+such LV that none of its own calls is building: one whose clean-up failed, or one that the `lvm`
+process of a cancelled call created after the call had cleaned up.
 If removing one after a failed call fails too, the call's error says so, and lvmd counts it in
 `topolvm_lvmd_incomplete_snapshot_cleanup_failures_total`, served with lvmd's metrics, or with
 topolvm-node's when lvmd is embedded.
