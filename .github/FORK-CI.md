@@ -13,11 +13,14 @@ inherited from upstream ran on every push to a pull request: 27 runs and about
   below. Workflows that can be dispatched must be on the default branch.
 - **`chart-v17.3.1-fast`** holds the chart and `fork-chart.yaml`; **`bench`**
   holds `bench.yaml`. Their fork-only commits delete upstream's workflows too.
-- **`main`, `base-v0.42.1` and `base-chart-v17.3.1`** are copies of upstream and
-  keep upstream's workflows. Nothing makes them run: no pull request is open
-  against them, schedules run only on the default branch, and nobody pushes to
-  them. Do not sync `main` with upstream through GitHub: a push to `main` would
-  run upstream's push-on-main workflows. Rebase onto upstream locally instead.
+- **`base-v0.42.1` and `base-chart-v17.3.1`** are copies of upstream's release
+  tags and keep upstream's workflows. Nothing makes them run: no pull request is
+  open against them, schedules run only on the default branch, and nobody pushes
+  to them.
+- **There is no `main`.** It was deleted on 2026-11-13, so that "Sync fork" has
+  no branch to push upstream's commits to. Do not push a branch named `main` to
+  this fork: its tree would carry upstream's push-on-main workflows and run
+  them. Rebase onto upstream locally instead.
 
 | workflow | file, branch | runs on | does |
 |---|---|---|---|
@@ -82,9 +85,8 @@ Job-minutes, from the runs of 2026-11-12 on GitHub-hosted runners.
   workflow, which is disabled for this reason.
 - **Upstream's workflows** `Main`, `e2e-k8s`, `e2e-k8s-incluster-lvmd` and `pr`
   show as deleted, since the default branch no longer has them, and an old
-  `Fork image (dry run)` has no file on any branch. A push to `main` would bring
-  upstream's back and run them: keep `main` as it is, or delete it if no copy
-  of upstream is wanted in the fork.
+  `Fork image (dry run)` has no file on any branch. A push of a branch named
+  `main` would bring upstream's back and run them.
 
 ## Upstream's numbers
 
