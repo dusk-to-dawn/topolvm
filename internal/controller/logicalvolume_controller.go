@@ -214,7 +214,14 @@ func (r *LogicalVolumeReconciler) createLV(ctx context.Context, log logr.Logger,
 				lv.Status.Message = "failed to check volume existence"
 				return err
 			}
-			if existingLV != nil {
+			switch {
+			case existingLV != nil && isInactive(existingLV):
+				// lvmd gives a snapshot its name when it is complete and
+				// activates it as the last step. One that is still inactive
+				// was left between the two: lvmd activates it when asked to
+				// create it again.
+				log.Info("existing snapshot LV is not active yet; asking lvmd to finish it", "name", lv.Name, "uid", lv.UID)
+			case existingLV != nil:
 				r.adoptLV(log, lv, existingLV)
 				return nil
 			}
@@ -269,6 +276,13 @@ func (r *LogicalVolumeReconciler) waitForCachedVolumeID(ctx context.Context, log
 	if err != nil {
 		log.Info("the cache did not show the new volume ID in time", "name", lv.Name, "timeout", cacheCatchUpTimeout)
 	}
+}
+
+// isInactive reports whether lvmd lists v as inactive. An lvmd that does not
+// report attributes lists every volume as active.
+func isInactive(v *proto.LogicalVolume) bool {
+	attr := v.GetAttr()
+	return len(attr) > 4 && attr[4] == '-'
 }
 
 // adoptLV records an existing LVM LV, found by its name, as the volume of lv.

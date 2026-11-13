@@ -596,6 +596,74 @@ var _ = Describe("LogicalVolume controller createLV", func() {
 	})
 })
 
+// inactiveSnapshotLVM lists a snapshot of the LogicalVolume as lvmd does
+// when it was renamed but not activated yet, and activates it when asked to
+// create it.
+type inactiveSnapshotLVM struct {
+	fakeLVM
+	attr          string
+	snapshotCalls int
+}
+
+// CreateLVSnapshot implements proto.LVServiceClient.
+func (f *inactiveSnapshotLVM) CreateLVSnapshot(ctx context.Context, in *proto.CreateLVSnapshotRequest, opts ...grpc.CallOption) (*proto.CreateLVSnapshotResponse, error) {
+	f.snapshotCalls++
+	f.attr = "Vwi-a-tz--"
+	f.volumes[0].Attr = f.attr
+	return &proto.CreateLVSnapshotResponse{Snapshot: f.volumes[0]}, nil
+}
+
+var _ = Describe("LogicalVolume controller createLV with an inactive snapshot", func() {
+	for _, tc := range []struct {
+		attr      string
+		wantCalls int
+	}{
+		// Renamed but not activated: lvmd is asked to finish it.
+		{"Vwi---tz--", 1},
+		// Active: adopted as it is.
+		{"Vwi-a-tz--", 0},
+		// An lvmd that does not report attributes: adopted, as before.
+		{"", 0},
+	} {
+		It(fmt.Sprintf("should ask lvmd %d times for a snapshot listed with attributes %q", tc.wantCalls, tc.attr), func() {
+			ctx := context.Background()
+			suffix := fmt.Sprintf("-inactive-snap-%d-%d", tc.wantCalls, len(tc.attr))
+			source := topolvmv1.LogicalVolume{
+				ObjectMeta: metav1.ObjectMeta{Name: logicalVolumeNameBase + suffix + "-source"},
+				Spec: topolvmv1.LogicalVolumeSpec{
+					NodeName: nodeNameBase + suffix,
+					Size:     *resource.NewQuantity(1<<30, resource.BinarySI),
+				},
+			}
+			Expect(k8sClient.Create(ctx, &source)).To(Succeed())
+			source.Status.VolumeID = string(source.UID)
+			source.Status.CurrentSize = resource.NewQuantity(1<<30, resource.BinarySI)
+			Expect(k8sClient.Status().Update(ctx, &source)).To(Succeed())
+			snap := topolvmv1.LogicalVolume{
+				ObjectMeta: metav1.ObjectMeta{Name: logicalVolumeNameBase + suffix},
+				Spec: topolvmv1.LogicalVolumeSpec{
+					NodeName:   source.Spec.NodeName,
+					Size:       *resource.NewQuantity(1<<30, resource.BinarySI),
+					Source:     source.Name,
+					AccessType: "ro",
+				},
+			}
+			Expect(k8sClient.Create(ctx, &snap)).To(Succeed())
+
+			lvm := &inactiveSnapshotLVM{fakeLVM: fakeLVM{volumes: []*proto.LogicalVolume{
+				{Name: string(snap.UID), SizeBytes: 1 << 30, Attr: tc.attr},
+			}}}
+			reconciler := NewLogicalVolumeReconcilerWithServices(k8sClient, snap.Spec.NodeName, lvm, lvm)
+			Expect(reconciler.createLV(ctx, GinkgoLogr, &snap)).To(Succeed())
+			Expect(lvm.snapshotCalls).To(Equal(tc.wantCalls))
+			var updated topolvmv1.LogicalVolume
+			Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(&snap), &updated)).To(Succeed())
+			Expect(updated.Status.VolumeID).To(Equal(string(snap.UID)))
+			Expect(updated.Status.CurrentSize.Value()).To(Equal(int64(1 << 30)))
+		})
+	}
+})
+
 // snapshotFailingLVM fails CreateLVSnapshot after leaving a partial LV behind,
 // as lvmd did before it cleaned up after every failed step.
 type snapshotFailingLVM struct {
