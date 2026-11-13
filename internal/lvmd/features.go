@@ -7,6 +7,7 @@ import (
 	"slices"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/topolvm/topolvm/pkg/lvmd/proto"
 	"google.golang.org/grpc"
@@ -48,18 +49,23 @@ func FeaturesUnaryInterceptor(ctx context.Context, req any, _ *grpc.UnaryServerI
 // What is known about lvmd is tied to one lvmd process: each connection the
 // client makes talks to the first lvmd it reaches and never reconnects, so a
 // call made on it cannot reach a replacement. When the connection leaves the
-// READY state, or a call on it fails with Unavailable, the client starts over
-// with a new connection, on which capacity changes are serial again until a
-// response shows the feature. Connections are closed when ctx ends.
+// READY state, which with idleness disabled happens only when lvmd closes or
+// drains it, or a call on it fails with Unavailable, the client retires it:
+// later calls use a new connection, on which capacity changes are serial
+// again until a response shows the feature. Calls still in flight on a
+// retired connection may finish, as lvmd's graceful stop lets them; the
+// connection is closed once they have, or after retiredConnectionDrainTimeout.
+// Connections are closed when ctx ends.
 func NewCapacityGuardedLVServiceClient(ctx context.Context, socketPath string) proto.LVServiceClient {
 	g := &capacityGuardedLVServiceClient{ctx: ctx, socketPath: socketPath}
 	go func() {
 		<-ctx.Done()
 		g.mu.Lock()
-		defer g.mu.Unlock()
-		if g.cur != nil {
-			g.cur.close()
-			g.cur = nil
+		c := g.cur
+		g.cur = nil
+		g.mu.Unlock()
+		if c != nil {
+			c.close()
 		}
 	}()
 	return g
@@ -67,13 +73,18 @@ func NewCapacityGuardedLVServiceClient(ctx context.Context, socketPath string) p
 
 var errLVMDReplaced = errors.New("lvmd connection is over: a new connection is used for the next call")
 
+// retiredConnectionDrainTimeout bounds how long a retired connection is kept
+// open for the calls still in flight on it.
+var retiredConnectionDrainTimeout = 5 * time.Minute
+
 type capacityGuardedLVServiceClient struct {
 	ctx        context.Context
 	socketPath string
 	// serial is held around each guarded call while the connection's lvmd
 	// is not known to reserve capacity.
 	serial sync.Mutex
-	// mu protects cur.
+	// mu protects cur, and makes taking a connection for a call atomic with
+	// retiring it.
 	mu  sync.Mutex
 	cur *lvmdConnection
 }
@@ -88,23 +99,59 @@ type lvmdConnection struct {
 	// reserves is whether the last successful response came from an lvmd
 	// that reserves capacity.
 	reserves atomic.Bool
-	closed   sync.Once
+
+	// mu protects inflight, retired and drainTimer.
+	mu         sync.Mutex
+	inflight   int
+	retired    bool
+	drainTimer *time.Timer
+	closed     sync.Once
 }
 
 func (c *lvmdConnection) close() {
 	c.closed.Do(func() { _ = c.conn.Close() })
 }
 
-// current returns the connection to use, making one if there is none.
-func (g *capacityGuardedLVServiceClient) current() (*lvmdConnection, error) {
+// acquire returns the connection for a call, making one if there is none,
+// and counts the call on it. Call release when the call has returned.
+func (g *capacityGuardedLVServiceClient) acquire() (*lvmdConnection, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if g.ctx.Err() != nil {
 		return nil, g.ctx.Err()
 	}
-	if g.cur != nil {
-		return g.cur, nil
+	if g.cur == nil {
+		c, err := g.newConnection()
+		if err != nil {
+			return nil, err
+		}
+		g.cur = c
 	}
+	// Counted under g.mu: a connection is retired only after it has been
+	// taken out of g.cur under g.mu, so every call that got it is counted
+	// before its retirement looks at the count.
+	g.cur.mu.Lock()
+	g.cur.inflight++
+	g.cur.mu.Unlock()
+	return g.cur, nil
+}
+
+// release ends a call counted by acquire, and closes the connection if it is
+// retired and this was its last call.
+func (g *capacityGuardedLVServiceClient) release(c *lvmdConnection) {
+	c.mu.Lock()
+	c.inflight--
+	last := c.retired && c.inflight == 0
+	if last && c.drainTimer != nil {
+		c.drainTimer.Stop()
+	}
+	c.mu.Unlock()
+	if last {
+		c.close()
+	}
+}
+
+func (g *capacityGuardedLVServiceClient) newConnection() (*lvmdConnection, error) {
 	c := &lvmdConnection{}
 	dial := func(ctx context.Context, _ string) (net.Conn, error) {
 		if c.connected.Load() {
@@ -118,19 +165,21 @@ func (g *capacityGuardedLVServiceClient) current() (*lvmdConnection, error) {
 	}
 	conn, err := grpc.NewClient("passthrough:///"+g.socketPath,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithContextDialer(dial))
+		grpc.WithContextDialer(dial),
+		// Without idleness, the connection leaves READY only when its
+		// transport is lost, so an idle period does not retire it.
+		grpc.WithIdleTimeout(0))
 	if err != nil {
 		return nil, err
 	}
 	c.conn = conn
 	c.client = proto.NewLVServiceClient(conn)
-	g.cur = c
 	go g.watch(c)
 	return c, nil
 }
 
 // watch retires c once it leaves the READY state, that is once the lvmd it
-// reached has gone away.
+// reached has closed or is draining the connection.
 func (g *capacityGuardedLVServiceClient) watch(c *lvmdConnection) {
 	state := c.conn.GetState()
 	for state != connectivity.Ready {
@@ -144,7 +193,8 @@ func (g *capacityGuardedLVServiceClient) watch(c *lvmdConnection) {
 	}
 }
 
-// retire stops using c: the next call makes a new connection.
+// retire stops giving c to new calls. Calls in flight on it may finish; it is
+// closed when the last of them returns, or after the drain timeout.
 func (g *capacityGuardedLVServiceClient) retire(c *lvmdConnection) {
 	c.reserves.Store(false)
 	g.mu.Lock()
@@ -152,24 +202,43 @@ func (g *capacityGuardedLVServiceClient) retire(c *lvmdConnection) {
 		g.cur = nil
 	}
 	g.mu.Unlock()
-	c.close()
+
+	c.mu.Lock()
+	if c.retired {
+		c.mu.Unlock()
+		return
+	}
+	c.retired = true
+	idle := c.inflight == 0
+	if !idle {
+		c.drainTimer = time.AfterFunc(retiredConnectionDrainTimeout, c.close)
+	}
+	c.mu.Unlock()
+	if idle {
+		c.close()
+	}
 }
 
 func guardedCall[Resp any](ctx context.Context, g *capacityGuardedLVServiceClient, opts []grpc.CallOption,
 	call func(client proto.LVServiceClient, opts ...grpc.CallOption) (Resp, error)) (Resp, error) {
 	var zero Resp
-	c, err := g.current()
+	c, err := g.acquire()
 	if err != nil {
 		return zero, status.Error(codes.Unavailable, err.Error())
 	}
+	// Only a call on a connection whose lvmd has shown that it reserves
+	// capacity runs concurrently with others. Any other call waits for the
+	// others to finish, and then uses whichever connection is current.
 	if !c.reserves.Load() {
+		g.release(c)
 		g.serial.Lock()
 		defer g.serial.Unlock()
-		// The connection may have been replaced while this call waited.
-		if c, err = g.current(); err != nil {
+		if c, err = g.acquire(); err != nil {
 			return zero, status.Error(codes.Unavailable, err.Error())
 		}
 	}
+	defer g.release(c)
+
 	var header metadata.MD
 	resp, err := call(c.client, append(slices.Clone(opts), grpc.Header(&header))...)
 	if err != nil {
@@ -210,10 +279,11 @@ func (g *capacityGuardedLVServiceClient) CreateLVSnapshot(ctx context.Context, i
 }
 
 func (g *capacityGuardedLVServiceClient) RemoveLV(ctx context.Context, in *proto.RemoveLVRequest, opts ...grpc.CallOption) (*proto.Empty, error) {
-	c, err := g.current()
+	c, err := g.acquire()
 	if err != nil {
 		return nil, status.Error(codes.Unavailable, err.Error())
 	}
+	defer g.release(c)
 	resp, err := c.client.RemoveLV(ctx, in, opts...)
 	if status.Code(err) == codes.Unavailable && c.connected.Load() {
 		g.retire(c)
