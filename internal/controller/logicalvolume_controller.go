@@ -101,7 +101,10 @@ func (r *LogicalVolumeReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 				// reconciler's own status update that the cache did not show
 				// yet. The LV exists; the next pass adopts or skips it.
 				log.Info("LogicalVolume changed while its LV was created; reading it again", "name", lv.Name)
-				return ctrl.Result{RequeueAfter: conflictRequeueDelay}, nil
+				// Requeue goes through the controller's rate limiter, so a
+				// cache that stays stale is retried with backoff, as an error
+				// would be, without being reported as one.
+				return ctrl.Result{Requeue: true}, nil //nolint:staticcheck // RequeueAfter would bypass the backoff
 			case err != nil:
 				log.Error(err, "failed to create LV", "name", lv.Name)
 				return ctrl.Result{}, err

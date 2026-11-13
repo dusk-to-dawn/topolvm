@@ -187,7 +187,7 @@ var _ = Describe("LogicalVolume controller in a burst", func() {
 		return lv
 	}
 
-	It("should requeue without an error when its status update conflicts", func() {
+	It("should requeue with backoff and without an error when its status update conflicts", func() {
 		ctx := context.Background()
 		lv := newPresetLV(ctx, "-status-conflict")
 		conflicted := false
@@ -212,7 +212,9 @@ var _ = Describe("LogicalVolume controller in a burst", func() {
 
 		res, err := r.Reconcile(ctx, req)
 		Expect(err).NotTo(HaveOccurred())
-		Expect(res.RequeueAfter).To(BeNumerically(">", 0))
+		// Through the controller's rate limiter, not after a fixed delay.
+		Expect(res.Requeue).To(BeTrue()) //nolint:staticcheck // the reconciler sets it on purpose
+		Expect(res.RequeueAfter).To(BeZero())
 
 		// The next pass finds the LV the first one created, and adopts it.
 		_, err = r.Reconcile(ctx, req)
