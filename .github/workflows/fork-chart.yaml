@@ -4,16 +4,22 @@
 #
 # Trigger with a tag named topolvm-chart-v<chart version>, for example
 # topolvm-chart-v17.3.1-fast.1; the version must match charts/topolvm/Chart.yaml.
+# The chart is published only if the image it pins by default exists at that
+# digest, and its commit (the tag image-<appVersion>) passed a "full" Fork CI
+# round: see .github/FORK-CI.md on the fork's default branch.
 name: "Fork chart"
 
 on:
   push:
     tags:
       - "topolvm-chart-v*-fast.*"
-  workflow_dispatch:
 
 permissions:
   contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   chart:
@@ -21,12 +27,47 @@ jobs:
     runs-on: "ubuntu-24.04"
     timeout-minutes: 10
     permissions:
+      actions: read
       contents: read
       packages: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: "Require the pinned image, and a successful full Fork CI round for its commit"
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          APP_VERSION=$(sed -n 's/^appVersion: //p' charts/topolvm/Chart.yaml)
+          REFERENCE=$(sed -n 's/^  reference: //p' charts/topolvm/values.yaml)
+          OWNER=$(printf '%s' "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')
+          case "${REFERENCE}" in
+            "${APP_VERSION}@sha256:"*) ;;
+            *) echo "::error::image.reference '${REFERENCE}' is not appVersion ${APP_VERSION} pinned by digest"; exit 1 ;;
+          esac
+          PUBLISHED=$(docker buildx imagetools inspect "ghcr.io/${OWNER}/topolvm-with-sidecar:${APP_VERSION}" --format '{{ .Manifest.Digest }}')
+          if [ "${REFERENCE#*@}" != "${PUBLISHED}" ]; then
+            echo "::error::the chart pins ${REFERENCE#*@}, but topolvm-with-sidecar:${APP_VERSION} is ${PUBLISHED}"
+            exit 1
+          fi
+          TAG_OBJECT=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/image-${APP_VERSION}" --jq '.object.type + " " + .object.sha')
+          case "${TAG_OBJECT}" in
+            "commit "*) COMMIT=${TAG_OBJECT#commit } ;;
+            "tag "*) COMMIT=$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${TAG_OBJECT#tag }" --jq '.object.sha') ;;
+            *) echo "::error::cannot resolve tag image-${APP_VERSION}"; exit 1 ;;
+          esac
+          title="Fork CI full ${COMMIT}"
+          run=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/fork-ci.yaml/runs?status=success&per_page=100" \
+            --jq "[.workflow_runs[] | select(.display_title == \"${title}\")][0].id // empty")
+          if [ -z "${run}" ]; then
+            echo "::error::no successful 'full' Fork CI round for ${COMMIT}, the commit of image ${APP_VERSION}"
+            exit 1
+          fi
+          {
+            echo "Image: ghcr.io/${OWNER}/topolvm-with-sidecar:${REFERENCE}"
+            echo
+            echo "Fork CI round for ${COMMIT}: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${run}"
+          } | tee -a "${GITHUB_STEP_SUMMARY}"
       - name: "Install Helm"
         uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
         with:
