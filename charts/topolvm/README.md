@@ -82,7 +82,7 @@ See [Getting Started](https://github.com/topolvm/topolvm/blob/topolvm-chart-v17.
 | image.csi.nodeDriverRegistrar | string | `nil` | Specify csi-node-driver-registrar: image. If not specified, `ghcr.io/topolvm/topolvm-with-sidecar:{{ .Values.image.reference }}` will be used. |
 | image.pullPolicy | string | `nil` | TopoLVM image pullPolicy. |
 | image.pullSecrets | list | `[]` | List of imagePullSecrets. |
-| image.reference | string | `"0.42.1-fast.3@sha256:d79baf0426108598d6d08774265b59241d02f10b8634f5a7a79e51a56ff7efff"` | TopoLVM image reference (a tag and/or a digest, e.g. "0.41.0@sha256:...") to use. |
+| image.reference | string | `"0.42.1-fast.4@sha256:c3574201286fc74eb9aafe5699e3a70a58954a5c7b76e62ce95554d2f412b0ad"` | TopoLVM image reference (a tag and/or a digest, e.g. "0.41.0@sha256:...") to use. |
 | image.repository | string | `"ghcr.io/dusk-to-dawn/topolvm-with-sidecar"` | TopoLVM image repository to use. |
 | livenessProbe.csi_registrar | object | `{"failureThreshold":null,"initialDelaySeconds":10,"periodSeconds":60,"timeoutSeconds":3}` | Specify livenessProbe. # ref: https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/ |
 | livenessProbe.lvmd | object | `{"failureThreshold":null,"initialDelaySeconds":10,"periodSeconds":60,"timeoutSeconds":3}` | Specify livenessProbe. # ref: https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/ |

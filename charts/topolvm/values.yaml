@@ -11,7 +11,7 @@ image:
   repository: ghcr.io/dusk-to-dawn/topolvm-with-sidecar
 
   # image.reference -- TopoLVM image reference (a tag and/or a digest, e.g. "0.41.0@sha256:...") to use.
-  reference: 0.42.1-fast.3@sha256:d79baf0426108598d6d08774265b59241d02f10b8634f5a7a79e51a56ff7efff
+  reference: 0.42.1-fast.4@sha256:c3574201286fc74eb9aafe5699e3a70a58954a5c7b76e62ce95554d2f412b0ad
 
   # image.pullPolicy -- TopoLVM image pullPolicy.
   pullPolicy:  # Always
