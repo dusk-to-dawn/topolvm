@@ -12,6 +12,8 @@
 #   LVMD_ARGS    space-separated extra lvmd arguments
 #   PROVISIONER_ARGS space-separated extra csi-provisioner arguments
 #                (needs a chart with controller.csiProvisioner.args)
+#   CONTROLLER_IMAGE image for the topolvm-controller container only, e.g.
+#                upstream's release, to run this node plugin with that controller
 #   SIZES        volume counts per round, e.g. "1 12 40"
 #   MODES        any of "pods", "pvc" and "stagger" (see the round loop)
 #   STAGGER_MS   interval between claims in "stagger" rounds and the limit round
@@ -31,6 +33,7 @@ REPEATS=${REPEATS:-2}
 NODE_ARGS=${NODE_ARGS:-}
 LVMD_ARGS=${LVMD_ARGS:-}
 PROVISIONER_ARGS=${PROVISIONER_ARGS:-}
+CONTROLLER_IMAGE=${CONTROLLER_IMAGE:-}
 HERE=$(cd "$(dirname "$0")" && pwd)
 WORK=/tmp/bench
 E2E="$SRC/test/e2e"
@@ -140,6 +143,13 @@ cp "$WORK/values.yaml" "$OUT/values.yaml"
   -f "$WORK/values.yaml" >/dev/null
 "$HELM" get manifest -n topolvm-system topolvm > "$OUT/manifest.yaml"
 "$KUBECTL" wait --for=condition=available --timeout=180s -n topolvm-system deployments/topolvm-controller >/dev/null
+if [ -n "$CONTROLLER_IMAGE" ]; then
+  log "topolvm-controller from $CONTROLLER_IMAGE"
+  docker pull -q "$CONTROLLER_IMAGE" >/dev/null
+  "$KIND" load docker-image --name topolvm-e2e "$CONTROLLER_IMAGE" >/dev/null
+  "$KUBECTL" set image -n topolvm-system deployment/topolvm-controller "topolvm-controller=$CONTROLLER_IMAGE" >/dev/null
+  "$KUBECTL" rollout status -n topolvm-system deployment/topolvm-controller --timeout=180s >/dev/null
+fi
 "$KUBECTL" wait --for=condition=ready --timeout=180s -n topolvm-system -l app.kubernetes.io/component=node pod >/dev/null
 "$KUBECTL" create namespace "$NS" >/dev/null
 NODE_POD=$("$KUBECTL" get pod -n topolvm-system -l app.kubernetes.io/component=node \
@@ -157,6 +167,7 @@ done
   echo "node_args=$NODE_ARGS"
   echo "lvmd_args=$LVMD_ARGS"
   echo "provisioner_args=$PROVISIONER_ARGS"
+  echo "controller_image=${CONTROLLER_IMAGE:-$IMAGE}"
   echo "provisioner_container_args=$("$KUBECTL" get deploy -n topolvm-system topolvm-controller \
     -o jsonpath='{.spec.template.spec.containers[?(@.name=="csi-provisioner")].args}')"
   echo "node_container_args=$("$KUBECTL" get ds -n topolvm-system topolvm-node \
@@ -375,6 +386,15 @@ fi
 
 sudo journalctl -u lvmd1.service -o cat --since "@${T_START}" > "$OUT/lvmd1-full.log" || true
 "$KUBECTL" logs -n topolvm-system "$NODE_POD" -c topolvm-node --timestamps > "$OUT/node-full.log" || true
+# How often topolvm-node asked lvmd again for a volume it had just created.
+{
+  echo "created=$(grep -c '"created new LV"' "$OUT/node-full.log" || true)"
+  echo "adopted=$(grep -c '"set volumeID to existing LogicalVolume"' "$OUT/node-full.log" || true)"
+  echo "cache_wait_timeouts=$(grep -c 'the cache did not show the new volume ID in time' "$OUT/node-full.log" || true)"
+  echo "status_conflicts=$(grep -c 'the object has been modified\|changed while its LV was created' "$OUT/node-full.log" || true)"
+  echo "error_lines=$(grep -c '"level":"error"' "$OUT/node-full.log" || true)"
+} > "$OUT/adoptions.txt"
+cat "$OUT/adoptions.txt" >&2
 
 # Leave the runner as it was found, so that another configuration can run in
 # the same job.

@@ -1,20 +1,28 @@
 # Burst provisioning check: thin block volumes requested at once on one node
 # of a kind cluster, with lvmd on loop devices of the runner as in the e2e
-# suite. Configurations live in bench/matrix.json.
+# suite. Configurations live in bench/matrix.json. It runs only when
+# dispatched, for one candidate commit: by default the configuration that is
+# deployed (8 workers, this fork's controller), with "mixed" also the fork's
+# node plugin with upstream's controller. Upstream's own numbers were measured
+# once and are kept in the fork's notes, .github/FORK-CI.md. A configuration
+# takes about 10 to 12 job-minutes.
 name: "Bench"
+run-name: "Bench ${{ inputs.build_ref }}${{ inputs.mixed && ' with the mixed case' || '' }}"
 
 on:
-  push:
-    branches:
-      - "bench"
   workflow_dispatch:
     inputs:
-      configs:
-        description: "Comma-separated config names (empty: all enabled)"
-        required: false
-        type: string
       build_ref:
-        description: "Ref to use for configs whose image_mode is build (empty: as in matrix.json)"
+        description: "Full SHA of the candidate commit"
+        required: true
+        type: string
+      mixed:
+        description: "Also run the candidate's node plugin with upstream's controller"
+        required: false
+        default: false
+        type: boolean
+      configs:
+        description: "Comma-separated config names instead of the above (empty: as above)"
         required: false
         type: string
       sizes:
@@ -31,10 +39,16 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ inputs.build_ref }}
+  cancel-in-progress: true
+
 jobs:
   plan:
     runs-on: "ubuntu-24.04"
     timeout-minutes: 5
+    permissions:
+      contents: read
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
     steps:
@@ -45,11 +59,14 @@ jobs:
         env:
           CONFIGS: ${{ inputs.configs }}
           BUILD_REF: ${{ inputs.build_ref }}
+          MIXED: ${{ inputs.mixed }}
         run: |
           python3 - <<'EOF' >> "$GITHUB_OUTPUT"
           import json, os
           entries = json.load(open("bench/matrix.json"))
           wanted = [c.strip() for c in os.environ.get("CONFIGS", "").split(",") if c.strip()]
+          if not wanted and os.environ.get("MIXED") == "true":
+              wanted = ["candidate", "candidate-upstream-controller"]
           build_ref = os.environ.get("BUILD_REF", "").strip()
           out = []
           for e in entries:
@@ -68,7 +85,9 @@ jobs:
     needs: plan
     name: "${{ matrix.name }}"
     runs-on: "ubuntu-22.04"
-    timeout-minutes: 120
+    timeout-minutes: 45
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
@@ -139,6 +158,7 @@ jobs:
           NODE_ARGS: ${{ matrix.node_args }}
           LVMD_ARGS: ${{ matrix.lvmd_args }}
           PROVISIONER_ARGS: ${{ matrix.provisioner_args }}
+          CONTROLLER_IMAGE: ${{ matrix.controller_image }}
           SIZES: ${{ inputs.sizes || '1 12 40' }}
           REPEATS: ${{ inputs.repeats || '2' }}
         run: ./harness/bench/run.sh
@@ -152,6 +172,16 @@ jobs:
             python3 harness/bench/summary.py "$NAME-baseline" "$OUT-baseline" >> "$GITHUB_STEP_SUMMARY" || true
           fi
           python3 harness/bench/summary.py "$NAME" "$OUT" >> "$GITHUB_STEP_SUMMARY" || true
+          if [ -f "$OUT/adoptions.txt" ]; then
+            {
+              echo
+              echo "topolvm-node, whole run:"
+              echo
+              echo '```'
+              cat "$OUT/adoptions.txt"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
       - name: Upload results
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
