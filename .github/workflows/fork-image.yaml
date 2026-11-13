@@ -4,8 +4,9 @@
 #
 # Trigger with a tag named image-<version>, for example image-0.42.1-fast.2,
 # which publishes ghcr.io/<owner>/topolvm-with-sidecar:0.42.1-fast.2. The tag
-# deliberately does not start with "v": upstream's release workflow runs on
-# tags matching v*. A version that already exists is never overwritten.
+# deliberately does not start with "v", the shape of upstream's release tags.
+# A version that already exists is never overwritten, and only a commit with a
+# successful "full" Fork CI round is published (see .github/FORK-CI.md).
 #
 # Pinned here: the actions (by commit), BuildKit and the two base images of
 # the Dockerfile (by digest, through bake's named contexts). Not pinned:
@@ -17,15 +18,13 @@ on:
   push:
     tags:
       - "image-*"
-  workflow_dispatch:
-    inputs:
-      version:
-        description: "Image tag and TOPOLVM_VERSION, e.g. 0.42.1-fast.2"
-        required: true
-        type: string
 
 permissions:
   contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   BUILDKIT_IMAGE: "moby/buildkit:buildx-stable-1@sha256:c5f8862f52499773af85bc07695b2379ef08e8002352b0df2c4864c91d78dabe"
@@ -36,23 +35,30 @@ jobs:
   image:
     name: "build and push topolvm-with-sidecar (linux/amd64)"
     runs-on: "ubuntu-24.04"
-    timeout-minutes: 60
+    timeout-minutes: 30
     permissions:
+      actions: read
       contents: read
       packages: write
     steps:
+      - name: "Require a successful full Fork CI round for this commit"
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          title="Fork CI full ${GITHUB_SHA}"
+          run=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/fork-ci.yaml/runs?status=success&per_page=100" \
+            --jq "[.workflow_runs[] | select(.display_title == \"${title}\")][0].id // empty")
+          if [ -z "${run}" ]; then
+            echo "::error::no successful 'full' Fork CI round for ${GITHUB_SHA}: dispatch one, then push the tag again"
+            exit 1
+          fi
+          echo "Fork CI round: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${run}" | tee -a "${GITHUB_STEP_SUMMARY}"
       - name: "Resolve version"
         id: version
         env:
-          INPUT_VERSION: ${{ inputs.version }}
           REF_NAME: ${{ github.ref_name }}
-          REF_TYPE: ${{ github.ref_type }}
         run: |
-          if [ "${REF_TYPE}" = "tag" ]; then
-            VERSION="${REF_NAME#image-}"
-          else
-            VERSION="${INPUT_VERSION}"
-          fi
+          VERSION="${REF_NAME#image-}"
           if ! printf '%s' "${VERSION}" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+-[0-9A-Za-z.]+$'; then
             echo "::error::version must look like 0.42.1-fast.2, got '${VERSION}'"
             exit 1

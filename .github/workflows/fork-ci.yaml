@@ -1,0 +1,263 @@
+# The CI of this fork: one round per candidate commit, run only when
+# dispatched. Nothing in this fork runs on push, pull request or schedule.
+# See .github/FORK-CI.md for the rules and the cost of each round.
+#
+# Stage 1 (unit): lint, check-uncommitted and the unit tests as root with real
+# LVM. Stage 2 (e2e), only after stage 1: upstream's kind suite, and the suite
+# with lvmd in the cluster, as a DaemonSet and embedded.
+#
+#   scope "smoke": the newest Kubernetes version of the matrix, with the
+#     variants this fork changes: the default configuration, eight reconcile
+#     workers, and lvmd as a DaemonSet and embedded.
+#   scope "full": every Kubernetes version and every variant, legacy included,
+#     for the commit that is going to be released. Jobs that a successful
+#     "smoke" round of the same commit ran already are not repeated.
+#
+# The image and chart workflows publish only a commit with a successful "full"
+# round. They find it by its run name, so "ref" must be the full commit SHA.
+name: "Fork CI"
+run-name: "Fork CI ${{ inputs.scope }} ${{ inputs.ref }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Full 40-character SHA of the commit to test"
+        required: true
+        type: string
+      scope:
+        description: "smoke (default) or full (once, for a release)"
+        required: true
+        default: "smoke"
+        type: choice
+        options:
+          - "smoke"
+          - "full"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ inputs.ref }}
+  cancel-in-progress: true
+
+jobs:
+  plan:
+    name: "plan"
+    runs-on: "ubuntu-24.04"
+    timeout-minutes: 5
+    permissions:
+      actions: read
+    outputs:
+      unit: ${{ steps.plan.outputs.unit }}
+      kind: ${{ steps.plan.outputs.kind }}
+      incluster: ${{ steps.plan.outputs.incluster }}
+    steps:
+      - name: "Plan the round"
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REF: ${{ inputs.ref }}
+          SCOPE: ${{ inputs.scope }}
+        run: |
+          if ! printf '%s' "${REF}" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::ref must be a full 40-character commit SHA, got '${REF}'"
+            exit 1
+          fi
+          # Upstream's matrix, from its e2e-k8s-workflow.yaml and
+          # e2e-k8s-incluster-lvmd.yaml; the first version is the newest.
+          # Update it when rebasing onto a newer upstream.
+          smoke_run=""
+          if [ "${SCOPE}" = "full" ]; then
+            smoke_run=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/fork-ci.yaml/runs?status=success&per_page=100" \
+              --jq "[.workflow_runs[] | select(.display_title == \"Fork CI smoke ${REF}\")][0].id // empty")
+          fi
+          SMOKE_RUN="${smoke_run}" python3 - <<'EOF' >> "${GITHUB_OUTPUT}"
+          import json, os
+          versions = ["1.36.4", "1.35.8", "1.34.11"]
+          variants = {
+              "default": ("daemonset", False, False),
+              "scheduler-manifest": ("deployment", False, False),
+              "use-legacy": ("deployment", True, False),
+              "storage-capacity-scoring": ("none", False, False),
+              "concurrent-reconciles": ("daemonset", False, True),
+          }
+          smoke_variants = ["default", "concurrent-reconciles"]
+          lvmd_types = ["daemonset", "embedded"]
+          full = os.environ["SCOPE"] == "full"
+          covered = full and os.environ["SMOKE_RUN"] != ""
+          kind, incluster = [], []
+          for i, version in enumerate(versions):
+              for name, (extender, legacy, concurrent) in variants.items():
+                  in_smoke = i == 0 and name in smoke_variants
+                  if (full and not (covered and in_smoke)) or (not full and in_smoke):
+                      kind.append({"name": name, "kubernetes": version, "extender": extender,
+                                   "legacy": legacy, "concurrent": concurrent})
+              for lvmd in lvmd_types:
+                  in_smoke = i == 0
+                  if (full and not (covered and in_smoke)) or (not full and in_smoke):
+                      incluster.append({"kubernetes": version, "lvmd": lvmd})
+          print("unit=" + ("false" if covered else "true"))
+          print("kind=" + json.dumps({"include": kind}))
+          print("incluster=" + json.dumps({"include": incluster}))
+          EOF
+          {
+            echo "### Fork CI ${SCOPE} for \`${REF}\`"
+            echo
+            if [ -n "${smoke_run}" ]; then
+              echo "Stage 1 and the smoke jobs passed in ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${smoke_run}; they are not repeated."
+            fi
+          } >> "${GITHUB_STEP_SUMMARY}"
+          cat "${GITHUB_OUTPUT}"
+
+  unit:
+    name: "stage 1: lint and unit tests as root with real LVM"
+    needs: plan
+    if: ${{ needs.plan.outputs.unit == 'true' }}
+    runs-on: "ubuntu-22.04"
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.ref }}
+      - uses: $/.github/actions/setup-go
+        with:
+          go-version-file: "go.mod"
+          takumi-guard-bot-id: ${{ vars.TAKUMI_GUARD_BOT_ID }}
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - run: make setup
+      - run: make check-uncommitted
+      - run: make groupname-test
+      # lint, then every unit test, as root so that the real-LVM tests run.
+      - run: sudo make test 2>&1 | tee /tmp/unit-test.log
+      - name: "Report the device-mapper suspends of the snapshot steps"
+        if: ${{ !cancelled() }}
+        run: |
+          {
+            echo "### Snapshot steps on real LVM: device-mapper suspends"
+            echo
+            echo '```'
+            sed -n '/device-mapper suspends per step/,/^=== RUN\|^--- /p' /tmp/unit-test.log | head -n 40
+            echo '```'
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+  e2e-build:
+    name: "stage 2: build the e2e image"
+    needs: [plan, unit]
+    if: ${{ !cancelled() && needs.plan.result == 'success' && (needs.unit.result == 'success' || needs.unit.result == 'skipped') && fromJSON(needs.plan.outputs.kind).include[0] }}
+    runs-on: "ubuntu-22.04"
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.ref }}
+      - uses: $/.github/actions/setup-go
+        with:
+          go-version-file: "go.mod"
+          takumi-guard-bot-id: ${{ vars.TAKUMI_GUARD_BOT_ID }}
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: cache e2e sidecar binaries
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            test/e2e/tmpbin
+          key: e2e-sidecars-${{ hashFiles('csi-sidecars.mk', 'versions.mk') }}
+          restore-keys: |
+            e2e-sidecars-
+      - run: make -C test/e2e setup
+      - run: make -C test/e2e topolvm.img
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            bin
+            test/e2e/bin
+            test/e2e/topolvm.img
+          key: e2e-cache-${{ inputs.ref }}
+
+  e2e-kind:
+    name: "stage 2: e2e ${{ matrix.name }} (${{ matrix.kubernetes }})"
+    needs: [plan, unit, e2e-build]
+    if: ${{ !cancelled() && needs.e2e-build.result == 'success' }}
+    runs-on: "ubuntu-22.04"
+    timeout-minutes: 40
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      fail-fast: true
+      matrix: ${{ fromJSON(needs.plan.outputs.kind) }}
+    env:
+      KUBERNETES_VERSION: ${{ matrix.kubernetes }}
+      TEST_SCHEDULER_EXTENDER_TYPE: ${{ matrix.extender }}
+      TEST_LEGACY: ${{ matrix.legacy }}
+      TEST_CONCURRENT_RECONCILES: ${{ matrix.concurrent }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.ref }}
+      - uses: $/.github/actions/setup-go
+        with:
+          go-version-file: "go.mod"
+          takumi-guard-bot-id: ${{ vars.TAKUMI_GUARD_BOT_ID }}
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            bin
+            test/e2e/bin
+            test/e2e/topolvm.img
+          key: e2e-cache-${{ inputs.ref }}
+          fail-on-cache-miss: true
+      - run: touch test/e2e/topolvm.img # update timestamp not to rebuild image
+      - run: make -C test/e2e start-lvmd
+      - run: make -C test/e2e test
+
+  e2e-incluster:
+    name: "stage 2: e2e lvmd ${{ matrix.lvmd }} (${{ matrix.kubernetes }})"
+    needs: [plan, unit]
+    if: ${{ !cancelled() && needs.plan.result == 'success' && (needs.unit.result == 'success' || needs.unit.result == 'skipped') && fromJSON(needs.plan.outputs.incluster).include[0] }}
+    runs-on: "ubuntu-22.04"
+    timeout-minutes: 40
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      fail-fast: true
+      matrix: ${{ fromJSON(needs.plan.outputs.incluster) }}
+    env:
+      KUBERNETES_VERSION: ${{ matrix.kubernetes }}
+      TEST_LVMD_TYPE: ${{ matrix.lvmd }}
+      TEST_SCHEDULER_EXTENDER_TYPE: "none"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.ref }}
+      - uses: $/.github/actions/setup-go
+        with:
+          go-version-file: "go.mod"
+          takumi-guard-bot-id: ${{ vars.TAKUMI_GUARD_BOT_ID }}
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: cache e2e sidecar binaries
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            test/e2e/tmpbin
+          key: e2e-sidecars-${{ hashFiles('csi-sidecars.mk', 'versions.mk') }}
+          restore-keys: |
+            e2e-sidecars-
+      - run: make -C test/e2e incluster-lvmd/create-vg
+      - run: make -C test/e2e incluster-lvmd/setup-minikube
+      - run: make -C test/e2e incluster-lvmd/launch-minikube
+      - run: make -C test/e2e incluster-lvmd/test
