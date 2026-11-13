@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -385,5 +386,79 @@ func TestGracefulStopLetsFirstCallFinish(t *testing.T) {
 				t.Fatal("the call did not return")
 			}
 		})
+	}
+}
+
+// TestCapacityGuardUnderFlappingLVMD restarts lvmd 30 times on one socket
+// while 8 workers keep creating volumes, alternating an lvmd that reserves
+// capacity with one that does not, and hard with graceful stops. No two
+// capacity changes may ever overlap against an lvmd that does not reserve,
+// and no goroutine may be left behind.
+func TestCapacityGuardUnderFlappingLVMD(t *testing.T) {
+	sock := filepath.Join(t.TempDir(), "lvmd.sock")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	c := NewCapacityGuardedLVServiceClient(ctx, sock)
+
+	base := runtime.NumGoroutine()
+	var olderPeak int32
+	stopWorkers := make(chan struct{})
+	var wg sync.WaitGroup
+	defer func() {
+		select {
+		case <-stopWorkers:
+		default:
+			close(stopWorkers)
+		}
+		wg.Wait()
+	}()
+	for range 8 {
+		wg.Go(func() {
+			for {
+				select {
+				case <-stopWorkers:
+					return
+				default:
+				}
+				cctx, ccancel := context.WithTimeout(context.Background(), 2*time.Second)
+				_, _ = c.CreateLV(cctx, &proto.CreateLVRequest{Name: "x"})
+				ccancel()
+				time.Sleep(2 * time.Millisecond)
+			}
+		})
+	}
+	for i := range 30 {
+		svc := &slowLVService{}
+		var opts []grpc.ServerOption
+		reserving := i%2 == 0
+		if reserving {
+			opts = append(opts, grpc.UnaryInterceptor(FeaturesUnaryInterceptor))
+		}
+		srv := startLVService(t, sock, svc, opts...)
+		time.Sleep(150 * time.Millisecond)
+		if i%3 == 0 {
+			srv.Stop()
+		} else {
+			srv.GracefulStop()
+		}
+		if !reserving {
+			olderPeak = max(olderPeak, svc.peak.Load())
+		}
+	}
+	close(stopWorkers)
+	wg.Wait()
+	if olderPeak > 1 {
+		t.Errorf("%d capacity changes ran at once against an lvmd without reservations", olderPeak)
+	}
+
+	cancel()
+	deadline := time.Now().Add(5 * time.Second)
+	for runtime.NumGoroutine() > base+5 && time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if n := runtime.NumGoroutine(); n > base+5 {
+		buf := make([]byte, 1<<16)
+		k := runtime.Stack(buf, true)
+		t.Errorf("goroutines: %d after, %d before; stacks:\n%s", n, base, buf[:k])
 	}
 }
