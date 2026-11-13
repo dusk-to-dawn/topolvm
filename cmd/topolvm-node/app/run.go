@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -114,6 +115,20 @@ func subMain(ctx context.Context) error {
 				return fmt.Errorf("cannot set both --lvm-path and lvm-command-prefix")
 			}
 			lvmd.SetLVMCommandPrefix(config.lvmd.LVMCommandPrefix)
+		}
+
+		// Only one lvmd runs on a node at a time. The lock is next to the
+		// lvmd socket, whose directory only the socket mode mounts from the
+		// host by default: without that mount, it contends with nothing.
+		if _, err := os.Stat(filepath.Dir(config.lvmdSocket)); err == nil {
+			release, err := internallvmd.LockProcess(ctx, config.lvmdSocket)
+			if err != nil {
+				return err
+			}
+			defer release()
+		} else {
+			setupLog.Info("embedded lvmd runs without the one-lvmd-per-node lock: the directory of --lvmd-socket does not exist",
+				"dir", filepath.Dir(config.lvmdSocket))
 		}
 
 		lvService, vgService = lvmd.NewEmbeddedServiceClients(

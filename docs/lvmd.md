@@ -19,6 +19,16 @@ call that started it is cancelled, only the `nsenter` wrapper is stopped: `lvm` 
 the host and lvmd frees the slot when it exits. If as many commands hang as there are slots, later
 calls wait for a slot and fail at their deadlines instead of starting more processes.
 
+Only one lvmd serves a socket at a time. Before it touches LVM or its socket, lvmd takes an
+exclusive lock on the file `<socket-name>.lock` next to its socket, and holds it until it exits,
+however it exits. A second lvmd for the same socket waits, saying every 5 seconds which lvmd holds
+the lock, and serves and sweeps nothing until the first has exited; it has no timeout. lvmd
+processes in different Pods share the lock when they mount the socket's directory from the host, as
+the chart's lvmd DaemonSet does. topolvm-node with `--embed-lvmd` takes the same lock next to
+`--lvmd-socket` when that directory exists; it is shared only if the directory is mounted from the
+host. An lvmd older than this one takes no lock, so while either side is older, run only one lvmd
+Pod on a node at a time.
+
 Snapshots and clones are built under a temporary name, the volume's name followed by
 `.creating-` and 16 hexadecimal digits, and renamed to the volume's name as the last step.
 If lvmd stops before that, it removes such leftovers the next time it starts.

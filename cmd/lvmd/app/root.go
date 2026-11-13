@@ -82,6 +82,17 @@ func subMain(parentCtx context.Context) error {
 		command.SetLVMCommandPrefix(config.LVMCommandPrefix)
 	}
 
+	ctx, stop := signal.NotifyContext(parentCtx, os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	// Only one lvmd serves a socket at a time: wait, before touching LVM or
+	// the socket, until any other lvmd for it has exited.
+	release, err := lvmd.LockProcess(ctx, config.SocketName)
+	if err != nil {
+		return err
+	}
+	defer release()
+
 	vgs, err := command.ListVolumeGroups(parentCtx)
 	if err != nil {
 		logger.Error(err, "error while retrieving volume groups")
@@ -125,9 +136,6 @@ func subMain(parentCtx context.Context) error {
 	proto.RegisterVGServiceServer(grpcServer, vgService)
 	proto.RegisterLVServiceServer(grpcServer, lvmd.NewLVService(dcm, ocm, notifier))
 	grpc_health_v1.RegisterHealthServer(grpcServer, lvmd.NewHealthService())
-
-	ctx, stop := signal.NotifyContext(parentCtx, os.Interrupt, syscall.SIGTERM)
-	defer stop()
 
 	wg, pprofServer, metricsServer := startMetricsAndProfilingServers(logger)
 
