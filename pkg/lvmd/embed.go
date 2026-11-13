@@ -8,6 +8,7 @@ import (
 	"github.com/topolvm/topolvm/pkg/lvmd/proto"
 	lvmdTypes "github.com/topolvm/topolvm/pkg/lvmd/types"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/metrics"
 )
 
 func NewEmbeddedServiceClients(
@@ -18,6 +19,10 @@ func NewEmbeddedServiceClients(
 	proto.LVServiceClient,
 	proto.VGServiceClient,
 ) {
+	if err := internalLvmd.RegisterMetrics(metrics.Registry); err != nil {
+		log.FromContext(ctx).Error(err, "failed to register lvmd metrics")
+	}
+
 	// Snapshots that an earlier run left unfinished are removed before any
 	// call is served.
 	if vgs, err := internalLvmdCommand.ListVolumeGroups(ctx); err != nil {

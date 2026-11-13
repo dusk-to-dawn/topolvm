@@ -207,11 +207,12 @@ func (f *Fake) Invocations(t testing.TB) []Invocation {
 	return invs
 }
 
-// Fail makes every later run of the named sub-command (for example
-// "lvresize") fail without changing anything, until it is called with "".
-func (f *Fake) Fail(t testing.TB, subCommand string) {
+// Fail makes every later run of the named sub-commands (for example
+// "lvresize") fail without changing anything, until it is called with none
+// or with "".
+func (f *Fake) Fail(t testing.TB, subCommands ...string) {
 	t.Helper()
-	t.Setenv(envFail, subCommand)
+	t.Setenv(envFail, strings.Join(subCommands, ","))
 }
 
 // Pause makes the first later run of the named sub-command wait, before it
@@ -378,7 +379,7 @@ func Main(args []string) int {
 		return exitUsage
 	}
 
-	if fail := os.Getenv(envFail); fail != "" && fail == cmd {
+	if slices.Contains(strings.Split(os.Getenv(envFail), ","), cmd) {
 		fmt.Fprintf(os.Stderr, "  injected failure of %s\n", cmd)
 		return exitNotFound
 	}

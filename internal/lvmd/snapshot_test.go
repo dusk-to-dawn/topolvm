@@ -3,10 +3,12 @@ package lvmd
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	dto "github.com/prometheus/client_model/go"
 	"github.com/topolvm/topolvm/internal/lvmd/command"
 	"github.com/topolvm/topolvm/internal/lvmd/testutils/fakelvm"
 	"github.com/topolvm/topolvm/pkg/lvmd/proto"
@@ -79,6 +81,68 @@ func TestCreateLVSnapshotCleansUpAfterFailure(t *testing.T) {
 				t.Errorf("retry made a snapshot of %d bytes, want %d", res.GetSnapshot().GetSizeBytes(), tc.size)
 			}
 		})
+	}
+}
+
+func cleanupFailures(t *testing.T) float64 {
+	t.Helper()
+	var m dto.Metric
+	if err := incompleteSnapshotCleanupFailures.Write(&m); err != nil {
+		t.Fatal(err)
+	}
+	return m.GetCounter().GetValue()
+}
+
+// TestCreateLVSnapshotReportsFailedCleanup checks that when the incomplete
+// snapshot cannot be removed after a failure either, the error says so and
+// the failure is counted, and that the LV left behind keeps its build name:
+// a retry does not adopt it, and the sweep at lvmd's next start removes it.
+func TestCreateLVSnapshotReportsFailedCleanup(t *testing.T) {
+	ctx := testContext(t)
+	f := startFakeLVMD(t, fakelvm.Options{})
+	req := &proto.CreateLVSnapshotRequest{
+		Name: "snap", DeviceClass: fakeThinDC, SourceVolume: "existing-thin", AccessType: "ro",
+	}
+	before := cleanupFailures(t)
+
+	f.lvm.Fail(t, "lvchange", "lvremove")
+	_, err := f.lv.CreateLVSnapshot(ctx, req)
+	if status.Code(err) != codes.Internal || !strings.Contains(status.Convert(err).Message(), "removing the incomplete snapshot volume") {
+		t.Errorf("got %v, want an Internal error that reports the failed removal", err)
+	}
+	if got := cleanupFailures(t) - before; got != 1 {
+		t.Errorf("counted %v failed removals, want 1", got)
+	}
+	var leftover []string
+	for name := range fakeLVNames(t, f) {
+		if incompleteSnapshotNamePattern.MatchString(name) {
+			leftover = append(leftover, name)
+		}
+	}
+	if len(leftover) != 1 {
+		t.Fatalf("left %v under a build name, want one LV", leftover)
+	}
+
+	f.lvm.Fail(t)
+	res, err := f.lv.CreateLVSnapshot(ctx, req)
+	if err != nil {
+		t.Fatalf("retry failed: %v", err)
+	}
+	if res.GetSnapshot().GetName() != "snap" {
+		t.Errorf("retry returned %q, want snap", res.GetSnapshot().GetName())
+	}
+
+	vgs, err := command.ListVolumeGroups(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	RemoveIncompleteSnapshots(ctx, vgs, []*lvmdTypes.DeviceClass{{
+		Name: fakeThinDC, VolumeGroup: fakeVGName, Type: lvmdTypes.TypeThin,
+		ThinPoolConfig: &lvmdTypes.ThinPoolConfig{Name: fakePoolName, OverprovisionRatio: 2},
+	}})
+	expectNoIncompleteSnapshots(t, f)
+	if _, ok := fakeLVNames(t, f)["snap"]; !ok {
+		t.Error("the sweep removed the complete snapshot")
 	}
 }
 

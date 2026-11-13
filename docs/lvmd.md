@@ -22,6 +22,9 @@ calls wait for a slot and fail at their deadlines instead of starting more proce
 Snapshots and clones are built under a temporary name, the volume's name followed by
 `.creating-` and 16 hexadecimal digits, and renamed to the volume's name as the last step.
 If lvmd stops before that, it removes such leftovers the next time it starts.
+If removing one after a failed call fails too, the call's error says so, and lvmd counts it in
+`topolvm_lvmd_incomplete_snapshot_cleanup_failures_total`, served with lvmd's metrics, or with
+topolvm-node's when lvmd is embedded.
 
 ## Config File Format
 

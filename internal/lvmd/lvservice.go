@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/topolvm/topolvm/internal/lvmd/command"
 	"github.com/topolvm/topolvm/pkg/lvmd/proto"
 	lvmdTypes "github.com/topolvm/topolvm/pkg/lvmd/types"
@@ -17,6 +18,30 @@ import (
 // snapshotCleanupTimeout bounds the removal of an incomplete snapshot, which
 // runs even when the call that created it has been cancelled.
 var snapshotCleanupTimeout = 2 * time.Minute
+
+// incompleteSnapshotCleanupFailures counts incomplete snapshots that could not
+// be removed after a failed CreateLVSnapshot.
+var incompleteSnapshotCleanupFailures = prometheus.NewCounter(prometheus.CounterOpts{
+	Namespace: "topolvm",
+	Subsystem: "lvmd",
+	Name:      "incomplete_snapshot_cleanup_failures_total",
+	Help:      "Incomplete snapshot volumes that lvmd failed to remove after a failed CreateLVSnapshot.",
+})
+
+func init() {
+	prometheus.MustRegister(incompleteSnapshotCleanupFailures)
+}
+
+// RegisterMetrics registers lvmd's metrics with reg too. lvmd serves the
+// default registry; topolvm-node, which serves a registry of its own, calls
+// this when it embeds lvmd.
+func RegisterMetrics(reg prometheus.Registerer) error {
+	err := reg.Register(incompleteSnapshotCleanupFailures)
+	if errors.As(err, &prometheus.AlreadyRegisteredError{}) {
+		return nil
+	}
+	return err
+}
 
 // NewLVService creates a new LVServiceServer
 func NewLVService(dcmapper *DeviceClassManager, ocmapper *LvcreateOptionClassManager, notifyFunc func()) proto.LVServiceServer {
@@ -304,7 +329,9 @@ func (s *lvService) CreateLVSnapshot(ctx context.Context, req *proto.CreateLVSna
 			logger.Info("deleted incomplete snapshot volume", "buildName", buildName)
 		case errors.Is(rmErr, command.ErrNotFound):
 		default:
+			incompleteSnapshotCleanupFailures.Inc()
 			logger.Error(rmErr, "failed to delete incomplete snapshot volume", "buildName", buildName)
+			return nil, status.Errorf(codes.Internal, "%v; removing the incomplete snapshot volume %s also failed: %v", err, buildName, rmErr)
 		}
 		return nil, status.Error(codes.Internal, err.Error())
 	}
